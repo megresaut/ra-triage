@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from ra_triage.config.registry import RepoConfig, get_project
 from ra_triage.db import engine as engine_module
 from ra_triage.db import repo
 from ra_triage.db.models import AgentRun, Bug
@@ -417,3 +419,191 @@ def get_prompt_endpoint(
         prompt_path.read_text(encoding="utf-8"),
         media_type="text/markdown",
     )
+
+
+# --- Diff endpoints (Agent 6) --------------------------------------------
+
+
+class DiffResponse(BaseModel):
+    """Unified diff of a bug's worktree vs ``origin/<main_branch>``."""
+
+    repo: str
+    base_ref: str
+    head_ref: str
+    diff: str
+
+
+class DiffSummaryResponse(BaseModel):
+    """Shortstat summary of the Fixer's changes in a worktree."""
+
+    repo: str
+    files_changed: int
+    insertions: int
+    deletions: int
+
+
+def _resolve_repo_config(project_id: str, repo_name: str) -> RepoConfig:
+    """Return the registry entry for ``(project_id, repo_name)`` or 404."""
+    try:
+        project = get_project(project_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown project: {project_id}"
+        ) from exc
+    for r in project.repos:
+        if r.name == repo_name:
+            return r
+    raise HTTPException(
+        status_code=404,
+        detail=f"Repo {repo_name!r} not configured on project {project_id!r}",
+    )
+
+
+def _run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run ``git <args>`` in ``cwd``; capture stdout as text.
+
+    Uses ``subprocess.run`` (blocking) because the diff endpoints run on
+    FastAPI's threadpool (sync def) and the canonical git subprocess
+    helpers in ``workspaces.worktree`` are async. Keeping this local
+    keeps the module dependency surface small.
+    """
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@router.get("/bugs/{bug_id}/diff", response_model=DiffResponse)
+def get_bug_diff(
+    bug_id: int,
+    repo: str = Query(..., description="Repo name from the project registry"),
+    session: Session = Depends(get_session),
+) -> DiffResponse:
+    """Return the unified diff of the bug's worktree vs ``origin/<main>``.
+
+    Strategy: locate the bug, resolve the repo via the project registry,
+    derive the worktree path via ``workspaces.worktree.path_for``. 404 if
+    the worktree doesn't exist on disk (pipeline hasn't started, bug was
+    cleaned up, or the repo name is wrong). Runs ``git diff --no-color
+    origin/<main_branch>`` in the worktree and returns stdout verbatim.
+
+    On a git failure we surface the stderr as a 500 — the frontend
+    renders the error text so operators can act.
+    """
+    # Reuse the shadowing-adjacent name resolution.
+    bug = _repo_module_get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+
+    repo_config = _resolve_repo_config(bug.project_id, repo)
+    worktree = wt_module.path_for(bug_id, repo_config.name)
+    if not worktree.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No worktree on disk for bug {bug_id} repo {repo_config.name!r}",
+        )
+
+    base_ref = f"origin/{repo_config.main_branch}"
+    head_ref = f"{repo_config.branch_prefix}{bug_id}"
+
+    completed = _run_git(
+        ["diff", "--no-color", base_ref],
+        cwd=worktree,
+    )
+    if completed.returncode != 0:
+        logger.warning(
+            "git diff failed for bug %d repo %s: %s",
+            bug_id,
+            repo_config.name,
+            completed.stderr.strip(),
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"git diff failed: {completed.stderr.strip()}",
+        )
+
+    return DiffResponse(
+        repo=repo_config.name,
+        base_ref=base_ref,
+        head_ref=head_ref,
+        diff=completed.stdout,
+    )
+
+
+@router.get("/bugs/{bug_id}/diff/summary", response_model=DiffSummaryResponse)
+def get_bug_diff_summary(
+    bug_id: int,
+    repo: str = Query(..., description="Repo name from the project registry"),
+    session: Session = Depends(get_session),
+) -> DiffSummaryResponse:
+    """Return ``{files_changed, insertions, deletions}`` from ``git diff --shortstat``.
+
+    Cheaper than fetching the full diff; useful for the queue view.
+    """
+    bug = _repo_module_get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+
+    repo_config = _resolve_repo_config(bug.project_id, repo)
+    worktree = wt_module.path_for(bug_id, repo_config.name)
+    if not worktree.is_dir():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No worktree on disk for bug {bug_id} repo {repo_config.name!r}",
+        )
+
+    base_ref = f"origin/{repo_config.main_branch}"
+    completed = _run_git(
+        ["diff", "--no-color", "--shortstat", base_ref],
+        cwd=worktree,
+    )
+    if completed.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"git diff --shortstat failed: {completed.stderr.strip()}",
+        )
+
+    files, ins, dels = _parse_shortstat(completed.stdout)
+    return DiffSummaryResponse(
+        repo=repo_config.name,
+        files_changed=files,
+        insertions=ins,
+        deletions=dels,
+    )
+
+
+def _parse_shortstat(text: str) -> tuple[int, int, int]:
+    """Parse ``git diff --shortstat`` output.
+
+    Example: ``" 2 files changed, 4 insertions(+), 1 deletion(-)"``.
+    Any missing piece (no insertions, no deletions, or empty input)
+    collapses to zero.
+    """
+    files = ins = dels = 0
+    for chunk in text.strip().split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split()
+        if not parts:
+            continue
+        try:
+            n = int(parts[0])
+        except ValueError:
+            continue
+        if "file" in chunk:
+            files = n
+        elif "insertion" in chunk:
+            ins = n
+        elif "deletion" in chunk:
+            dels = n
+    return files, ins, dels
+
+
+# Alias to avoid shadowing the module-level ``repo`` import with the
+# ``repo`` query parameter on the diff endpoints above. ``repo.get_bug``
+# wouldn't work there because ``repo`` is the local query string.
+_repo_module_get_bug = repo.get_bug

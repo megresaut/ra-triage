@@ -1,6 +1,7 @@
 import { useParams } from "react-router-dom";
 
 import AgentTimeline from "@/components/AgentTimeline";
+import DiffViewer from "@/components/DiffViewer";
 import StatusBadge from "@/components/StatusBadge";
 import TriageMarkdown from "@/components/TriageMarkdown";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -8,9 +9,9 @@ import { useBugDetail } from "@/hooks/useBugDetail";
 import { useTriage } from "@/hooks/useTriage";
 import type { Bug } from "@/lib/api";
 
-// Bug detail view — header + real TRIAGE.md + agent timeline (Agent 5);
-// diff, test instance, confirm/reject, escalation brief remain labeled
-// stubs for Agents 6–9 to fill in.
+// Bug detail view — header + real TRIAGE.md + agent timeline (Agent 5)
+// + real Fixer diff viewer (Agent 6). Test instance, confirm/reject,
+// escalation brief remain labeled stubs for Agents 7–9 to fill in.
 
 function PlaceholderCard({ title, owner }: { title: string; owner: string }) {
   return (
@@ -188,7 +189,7 @@ export default function BugDetail() {
       <AgentTimeline bugId={bug.id} />
       <TriagePanel bugId={bug.id} state={bug.state} />
 
-      <PlaceholderCard title="Diff viewer (Agent 6)" owner="Agent 6" />
+      <DiffPanel bug={bug} />
       <PlaceholderCard title="Test instance (Agent 7)" owner="Agent 7" />
       <PlaceholderCard title="Confirm / Reject (Agent 8)" owner="Agent 8" />
       <PlaceholderCard
@@ -196,5 +197,41 @@ export default function BugDetail() {
         owner="Agent 9"
       />
     </div>
+  );
+}
+
+function DiffPanel({ bug }: { bug: Bug }) {
+  const repos = bug.affected_repos ?? [];
+  // Single-repo bugs are the Agent 6 happy path. Cross-repo (Agent 10)
+  // will wrap N DiffViewers in Tabs; for now we render a clear stub so
+  // operators know what's coming.
+  if (repos.length === 0) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Diff viewer</CardTitle>
+        </CardHeader>
+        <CardContent className="text-sm text-muted-foreground">
+          No affected repos on this bug yet — the Investigator hasn't run, or
+          the scope is indeterminate.
+        </CardContent>
+      </Card>
+    );
+  }
+  if (repos.length === 1) {
+    return <DiffViewer bugId={bug.id} repo={repos[0]} state={bug.state} />;
+  }
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">
+          Cross-repo diff (Agent 10)
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="text-sm text-muted-foreground">
+        Cross-repo tabs come online in Agent 10. Affected repos:{" "}
+        {repos.join(", ")}.
+      </CardContent>
+    </Card>
   );
 }

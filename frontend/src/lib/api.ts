@@ -147,3 +147,43 @@ export function bugLogsWsUrl(bugId: number): string {
   // Same host as backend REST; ``ws://`` scheme for the local dev.
   return `ws://127.0.0.1:5000/ws/bugs/${bugId}/logs`;
 }
+
+// --- Agent 6 additions ---------------------------------------------------
+
+/** Response from GET /bugs/:id/diff. */
+export interface DiffResponse {
+  repo: string;
+  base_ref: string;
+  head_ref: string;
+  diff: string;
+}
+
+/** Response from GET /bugs/:id/diff/summary. */
+export interface DiffSummaryResponse {
+  repo: string;
+  files_changed: number;
+  insertions: number;
+  deletions: number;
+}
+
+export async function fetchDiff(
+  bugId: number,
+  repo: string,
+  signal?: AbortSignal,
+): Promise<DiffResponse> {
+  return apiGet<DiffResponse>(`/bugs/${bugId}/diff`, {
+    signal,
+    query: { repo },
+  });
+}
+
+export async function fetchDiffSummary(
+  bugId: number,
+  repo: string,
+  signal?: AbortSignal,
+): Promise<DiffSummaryResponse> {
+  return apiGet<DiffSummaryResponse>(`/bugs/${bugId}/diff/summary`, {
+    signal,
+    query: { repo },
+  });
+}

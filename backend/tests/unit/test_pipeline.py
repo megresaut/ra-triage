@@ -1,18 +1,22 @@
 """Tests for ``ra_triage.orchestrator.pipeline.run_pipeline``.
 
-We mock out both the worktree subsystem AND the Investigator's ``run``
-method so tests exercise only the orchestrator's state-transition logic.
-Parametrized across the four outcomes Agent 5 is responsible for:
+We mock out both the worktree subsystem AND the agents' ``run`` methods
+so tests exercise only the orchestrator's state-transition logic.
+Agent 5 landed the Investigator; Agent 6 extends with Fixer + Tester. The
+single-repo happy path test stubs Investigator, Fixer, and Tester and
+confirms the bug ends in READY_FOR_REVIEW.
 
-  1. Happy single-repo → FIXING → TESTING → READY_FOR_REVIEW (stub).
-  2. Happy cross-repo → DESIGNING → FIXING_PARALLEL → INTEGRATION_TESTING → READY_FOR_REVIEW (stub).
+Covered outcomes:
+
+  1. Happy single-repo → FIXING → TESTING → READY_FOR_REVIEW (Agent 6).
+  2. Happy cross-repo → DESIGNING → FIXING_PARALLEL → INTEGRATION_TESTING → READY_FOR_REVIEW (Agent 10 stub).
   3. Escalation Brief in TRIAGE.md → BLOCKED.
   4. ``INVESTIGATOR_FAILED`` token → BLOCKED.
   5. Malformed scope → BLOCKED (with Escalation Brief appended).
 
-All tests use the ``db_session`` fixture from conftest for a real migrated
-DB so the state-transition path goes through ``db.repo.update_bug_state``
-end-to-end.
+All tests use the ``alembic_db`` fixture from conftest for a real
+migrated DB so the state-transition path goes through
+``db.repo.update_bug_state`` end-to-end.
 """
 
 from __future__ import annotations
@@ -133,6 +137,126 @@ def _make_fake_investigator(
     return _FakeInvestigator
 
 
+def _make_fake_agent(
+    *,
+    role: str,
+    completion_token: str | None,
+    append_section: str | None = None,
+    append_body: str = "(stub body)",
+) -> Any:
+    """Return a stand-in agent class for Fixer/Tester that writes TRIAGE.md.
+
+    When ``append_section`` is set, the fake's ``run`` appends that
+    section to TRIAGE.md before returning — matching what the real
+    Fixer / Tester does when they succeed.
+    """
+    from ra_triage.triage_md import parser as _parser
+
+    class _FakeAgent:
+        role = ""  # overridden below
+
+        async def run(
+            self, bug: Any, worktree: Path, context: dict[str, Any]
+        ) -> AgentResult:
+            triage_path = worktree / "TRIAGE.md"
+            if append_section is not None:
+                _parser.append(triage_path, append_section, append_body)
+            now = _now()
+            attempt = context["attempt"]
+            from ra_triage.settings import get_settings
+
+            settings = get_settings()
+            log_path = (
+                settings.logs_dir / str(bug.id) / f"{role}.{attempt}.log"
+            )
+            prompt_path = (
+                settings.prompts_dir / str(bug.id) / f"{role}.{attempt}.md"
+            )
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("fake log\n", encoding="utf-8")
+            prompt_path.parent.mkdir(parents=True, exist_ok=True)
+            prompt_path.write_text("fake prompt\n", encoding="utf-8")
+            return AgentResult(
+                exit_code=0
+                if completion_token and completion_token.endswith("_COMPLETE")
+                else 1,
+                completion_token=completion_token,
+                log_path=log_path,
+                prompt_path=prompt_path,
+                triage_md=triage_path.read_text(encoding="utf-8")
+                if triage_path.exists()
+                else "",
+                started_at=now,
+                ended_at=now,
+            )
+
+    _FakeAgent.role = role
+    return _FakeAgent
+
+
+def _patch_fixer_and_tester(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fixer_token: str | None = "FIXER_COMPLETE",
+    tester_token: str | None = "TESTER_COMPLETE",
+    fixer_section: str | None = "Fixer Notes",
+    tester_section: str | None = "Tester Notes",
+) -> None:
+    """Stub both Fixer and Tester on the pipeline module to crafted outcomes."""
+    monkeypatch.setattr(
+        pipeline_module,
+        "Fixer",
+        _make_fake_agent(
+            role="fixer",
+            completion_token=fixer_token,
+            append_section=fixer_section,
+            append_body="- Files changed: src/x.py\n- Key decisions: ok\n- Heads-up for Tester: none",
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "Tester",
+        _make_fake_agent(
+            role="tester",
+            completion_token=tester_token,
+            append_section=tester_section,
+            append_body="- Tests added (file:path): src/x_test.py\n- Suite result: all pass\n",
+        ),
+    )
+
+
+def _patch_tester_safety_clean(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the Tester safety check to report no prod-file changes.
+
+    Used when the test's worktree isn't a real git repo (so
+    ``git diff --name-only HEAD`` would fail). Tests that exercise
+    the safety check use a real git fixture instead (see
+    ``test_pipeline_fixer.py``).
+    """
+    from ra_triage.orchestrator import tester_safety
+
+    async def _fake_check(
+        worktree: Path, *, baseline: dict[str, str] | None = None
+    ) -> tester_safety.SafetyCheckResult:
+        return tester_safety.SafetyCheckResult(
+            changed_paths=[],
+            test_paths=[],
+            reverted_paths=[],
+            revert_errors=[],
+            had_violation=False,
+        )
+
+    async def _fake_snapshot(worktree: Path) -> dict[str, str]:
+        return {}
+
+    monkeypatch.setattr(
+        tester_safety, "check_and_revert_prod_changes", _fake_check
+    )
+    monkeypatch.setattr(
+        tester_safety, "snapshot_working_tree", _fake_snapshot
+    )
+
+
 # --- single-repo happy path ---------------------------------------------
 
 
@@ -160,6 +284,8 @@ async def test_pipeline_single_repo_happy_path(
             triage_md_body=triage_md,
         ),
     )
+    _patch_fixer_and_tester(monkeypatch)
+    _patch_tester_safety_clean(monkeypatch)
 
     session = engine_module.SessionLocal()
     bug = _make_bug(session)
@@ -180,13 +306,22 @@ async def test_pipeline_single_repo_happy_path(
         assert bug.deny_list_hit is False
 
         runs = repo_module.list_agent_runs(session, bug_id)
-        assert len(runs) == 1
-        run = runs[0]
-        assert run.agent_role == "investigator"
-        assert run.attempt == 1
-        assert run.completion_token == "INVESTIGATOR_COMPLETE"
-        assert run.exit_code == 0
-        assert run.triage_md_snapshot and "Root Cause" in run.triage_md_snapshot
+        roles = [r.agent_role for r in runs]
+        assert roles == ["investigator", "fixer", "tester"]
+        inv_run = runs[0]
+        assert inv_run.attempt == 1
+        assert inv_run.completion_token == "INVESTIGATOR_COMPLETE"
+        assert inv_run.exit_code == 0
+        assert (
+            inv_run.triage_md_snapshot
+            and "Root Cause" in inv_run.triage_md_snapshot
+        )
+        fixer_run = runs[1]
+        assert fixer_run.completion_token == "FIXER_COMPLETE"
+        assert fixer_run.worktree_repo == "avm-backend"
+        tester_run = runs[2]
+        assert tester_run.completion_token == "TESTER_COMPLETE"
+        assert tester_run.worktree_repo == "avm-backend"
     finally:
         session.close()
 
@@ -419,7 +554,7 @@ async def test_agent_run_row_has_ended_at_and_paths_populated(
     monkeypatch: pytest.MonkeyPatch,
     stub_worktrees: dict[str, Path],
 ) -> None:
-    """The single agent_runs row is updated with ended_at + triage_md_snapshot."""
+    """The investigator agent_runs row is updated with ended_at + triage_md_snapshot."""
     triage_md = (
         "## Root Cause\n\nsrc/x.py:1\n\n"
         "## Scope\n\n"
@@ -437,6 +572,8 @@ async def test_agent_run_row_has_ended_at_and_paths_populated(
             triage_md_body=triage_md,
         ),
     )
+    _patch_fixer_and_tester(monkeypatch)
+    _patch_tester_safety_clean(monkeypatch)
 
     session = engine_module.SessionLocal()
     bug = _make_bug(session, notion_page_id="row-1")
@@ -447,11 +584,16 @@ async def test_agent_run_row_has_ended_at_and_paths_populated(
 
     session = engine_module.SessionLocal()
     try:
-        runs = (
-            session.query(AgentRun).filter(AgentRun.bug_id == bug_id).all()
+        inv_runs = (
+            session.query(AgentRun)
+            .filter(
+                AgentRun.bug_id == bug_id,
+                AgentRun.agent_role == "investigator",
+            )
+            .all()
         )
-        assert len(runs) == 1
-        run = runs[0]
+        assert len(inv_runs) == 1
+        run = inv_runs[0]
         assert run.ended_at is not None
         assert run.started_at <= run.ended_at
         assert run.log_path.endswith("investigator.1.log")

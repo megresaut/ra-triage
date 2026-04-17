@@ -6,6 +6,7 @@ exercise its streaming + completion-token detection logic.
 
 Behavior is scenario-driven via the ``FAKE_CLAUDE_SCENARIO`` env var:
 
+  Investigator scenarios:
   - ``complete`` (default): emits a few stream-json lines including an
     assistant ``text`` block containing ``INVESTIGATOR_COMPLETE``, and
     writes a TRIAGE.md with all four canonical sections.
@@ -17,6 +18,25 @@ Behavior is scenario-driven via the ``FAKE_CLAUDE_SCENARIO`` env var:
     shorten ``timeout_seconds`` to a few seconds to exercise this).
   - ``malformed_scope``: emits ``INVESTIGATOR_COMPLETE`` with a TRIAGE.md
     whose Scope section has no parseable ``scope:`` key.
+  - ``cross_repo``: emits ``INVESTIGATOR_COMPLETE`` with cross-repo scope.
+
+  Fixer scenarios (Agent 6):
+  - ``fixer_complete``: appends ``## Fixer Notes`` to TRIAGE.md, creates
+    a marker file ``fixer_fixed.txt``, prints ``FIXER_COMPLETE``.
+  - ``fixer_failed``: appends ``## Fixer Failure`` to TRIAGE.md, prints
+    ``FIXER_FAILED``.
+  - ``fixer_escalation``: appends ``## Fixer Escalation`` to TRIAGE.md,
+    does NOT print a completion token (simulates the Fixer stopping on
+    deny-list contact).
+
+  Tester scenarios (Agent 6):
+  - ``tester_complete``: creates a test file, appends ``## Tester Notes``,
+    prints ``TESTER_COMPLETE``.
+  - ``tester_failed``: appends ``## Tester Failure``, prints ``TESTER_FAILED``.
+  - ``tester_writes_prod_code``: creates a TEST file AND modifies a
+    non-test file (``src/handler.go``) to exercise the orchestrator's
+    post-run safety check. Appends ``## Tester Notes`` and prints
+    ``TESTER_COMPLETE``.
 
 The subprocess writes TRIAGE.md into ``os.getcwd()`` (which equals the
 worktree path the base class passes in as ``cwd``). That exercises the
@@ -59,6 +79,19 @@ def assistant_event(content: list[dict[str, object]]) -> dict[str, object]:
 
 def system_event(subtype: str) -> dict[str, object]:
     return {"type": "system", "subtype": subtype}
+
+
+def _append_section(path: Path, name: str, body: str) -> None:
+    """Minimal TRIAGE.md ``## name`` appender (fixture-local duplicate of
+    ``ra_triage.triage_md.parser.append`` — keeping the fixture free of
+    cross-package imports).
+    """
+    block = f"## {name}\n\n{body.rstrip()}\n"
+    if path.exists() and path.stat().st_size > 0:
+        existing = path.read_text(encoding="utf-8")
+        path.write_text(existing.rstrip("\n") + "\n\n" + block, encoding="utf-8")
+    else:
+        path.write_text(block, encoding="utf-8")
 
 
 def write_triage_md(scenario: str, cwd: Path) -> None:
@@ -124,6 +157,79 @@ def write_triage_md(scenario: str, cwd: Path) -> None:
         # No TRIAGE.md — the test checks timeout handling.
         pass
 
+    # ---- Fixer scenarios ---------------------------------------------
+    elif scenario == "fixer_complete":
+        _append_section(
+            path,
+            "Fixer Notes",
+            "- Files changed: fixer_fixed.txt (touched)\n"
+            "- Key decisions: minimal reproducer patch\n"
+            "- Heads-up for Tester: regression test should assert file presence\n",
+        )
+        # Touch a file so the orchestrator's git diff shows work was done.
+        (cwd / "fixer_fixed.txt").write_text(
+            "stubbed fix by fake Fixer\n", encoding="utf-8"
+        )
+    elif scenario == "fixer_failed":
+        _append_section(
+            path,
+            "Fixer Failure",
+            "- Diagnosis: could not locate referenced function.\n"
+            "- What I tried: grep, glob on the described path.\n",
+        )
+    elif scenario == "fixer_escalation":
+        _append_section(
+            path,
+            "Fixer Escalation",
+            "- Reason: fix would require modifying a deny-list path.\n"
+            "- What I need: human approval to proceed.\n",
+        )
+
+    # ---- Tester scenarios --------------------------------------------
+    elif scenario == "tester_complete":
+        # Ensure the test file location looks like a test (matches the
+        # safety allowlist).
+        test_dir = cwd / "tests"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        (test_dir / "regression_test.go").write_text(
+            "// stubbed regression test\n", encoding="utf-8"
+        )
+        _append_section(
+            path,
+            "Tester Notes",
+            "- Tests added (file:path): tests/regression_test.go\n"
+            "- Suite result: 1 passed\n"
+            "- Any flakes observed: none\n",
+        )
+    elif scenario == "tester_failed":
+        _append_section(
+            path,
+            "Tester Failure",
+            "- Diagnosis: fix handles nil but returns 500 instead of 404.\n"
+            "- Evidence: test_name output.\n",
+        )
+    elif scenario == "tester_writes_prod_code":
+        test_dir = cwd / "tests"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        (test_dir / "regression_test.go").write_text(
+            "// stubbed regression test\n", encoding="utf-8"
+        )
+        # Prod-code modification — the orchestrator should revert this.
+        src_dir = cwd / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        prod_file = src_dir / "handler.go"
+        # Append (or create) something the Tester shouldn't be touching.
+        existing = (
+            prod_file.read_text(encoding="utf-8") if prod_file.exists() else ""
+        )
+        prod_file.write_text(existing + "// Tester edit\n", encoding="utf-8")
+        _append_section(
+            path,
+            "Tester Notes",
+            "- Tests added (file:path): tests/regression_test.go\n"
+            "- Also edited src/handler.go (should be reverted by orchestrator)\n",
+        )
+
 
 def main() -> int:
     scenario = SCENARIO
@@ -149,17 +255,34 @@ def main() -> int:
     write_triage_md(scenario, cwd)
 
     # Emit the completion token as part of an assistant text block —
-    # mirrors how the real CLI produces it.
-    if scenario == "failed":
+    # mirrors how the real CLI produces it. The token is scenario-keyed;
+    # ``fixer_escalation`` deliberately emits no token so the base class
+    # treats the run as a crash (pipeline then routes to BLOCKED on the
+    # ``## Fixer Escalation`` section regardless).
+    token_by_scenario: dict[str, str | None] = {
+        "complete": "INVESTIGATOR_COMPLETE",
+        "escalation": "INVESTIGATOR_COMPLETE",
+        "cross_repo": "INVESTIGATOR_COMPLETE",
+        "malformed_scope": "INVESTIGATOR_COMPLETE",
+        "failed": "INVESTIGATOR_FAILED",
+        "fixer_complete": "FIXER_COMPLETE",
+        "fixer_failed": "FIXER_FAILED",
+        "fixer_escalation": None,
+        "tester_complete": "TESTER_COMPLETE",
+        "tester_failed": "TESTER_FAILED",
+        "tester_writes_prod_code": "TESTER_COMPLETE",
+    }
+    token = token_by_scenario.get(scenario, "INVESTIGATOR_COMPLETE")
+    if token is not None:
         emit(
             assistant_event(
-                [text_block("I could not complete. INVESTIGATOR_FAILED")]
+                [text_block(f"Run complete. {token}")]
             )
         )
     else:
         emit(
             assistant_event(
-                [text_block("Investigation complete. INVESTIGATOR_COMPLETE")]
+                [text_block("Stopping before completion.")]
             )
         )
 

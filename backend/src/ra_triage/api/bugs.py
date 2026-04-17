@@ -4,8 +4,9 @@ Agent 2 surfaces:
   - GET /bugs
   - GET /bugs/{bug_id}
   - GET /bugs/{bug_id}/agent-runs
-  - POST /poller/enqueue  (manual-bypass v1 debugging endpoint — Agent 3 will
-    add the real Notion-driven poller.)
+  - POST /poller/enqueue  (manual-bypass for enqueueing a bug by Notion
+    page id. Agent 3 adds real-title/description fetch when NOTION_TOKEN
+    is configured and the caller omits title/description.)
 
 Pydantic response models are the shape `openapi-typescript` converts into the
 frontend's `types.ts`.
@@ -13,6 +14,7 @@ frontend's `types.ts`.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from datetime import datetime
 
@@ -23,7 +25,11 @@ from sqlalchemy.orm import Session
 from ra_triage.db import engine as engine_module
 from ra_triage.db import repo
 from ra_triage.db.models import AgentRun, Bug
+from ra_triage.integrations.notion import NotionClient, normalize_page
 from ra_triage.orchestrator.states import BugState
+from ra_triage.settings import get_settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["bugs"])
 
@@ -180,28 +186,81 @@ def list_agent_runs_endpoint(
     return [_agent_run_to_response(r) for r in runs]
 
 
+def _try_fetch_notion_page(page_id: str) -> dict[str, object] | None:
+    """Attempt to normalize a Notion page into bug fields.
+
+    Returns a dict of `title`/`description`/`repro_steps`/`severity`/
+    `reporter`, or None if Notion is unconfigured or the fetch fails.
+    Never raises — callers fall back to placeholders on None.
+    """
+    settings = get_settings()
+    if not settings.notion_token:
+        return None
+    try:
+        client = NotionClient(token=settings.notion_token)
+        page = client.fetch_page(page_id)
+        normalized = normalize_page(page.page)
+    except Exception:
+        logger.warning(
+            "Notion fetch failed for page_id=%s; falling back to placeholders",
+            page_id,
+            exc_info=True,
+        )
+        return None
+    return {
+        "title": normalized.title,
+        "description": normalized.description,
+        "repro_steps": normalized.repro_steps,
+        "severity": normalized.severity,
+        "reporter": normalized.reporter,
+    }
+
+
 @router.post("/poller/enqueue", response_model=BugResponse)
 def poller_enqueue(
     body: PollerEnqueueRequest,
     session: Session = Depends(get_session),
 ) -> BugResponse:
-    """Manually enqueue a bug by `notion_page_id`.
+    """Enqueue a bug by `notion_page_id`.
 
-    v1 debugging endpoint — Agent 3 will add the real Notion-driven polling
-    that populates title/description/etc. from the Notion page. Until then we
-    stub those fields so the pipeline can be exercised end-to-end.
+    Behavior:
+      - If `title` and `description` are provided in the body, use them
+        as-is (manual bypass — Agent 2's original behavior).
+      - If both are absent AND `NOTION_TOKEN` is configured, try fetching
+        the page from Notion and normalize it into bug fields. On Notion
+        fetch failure we fall back to the placeholder behavior and log.
+      - If both are absent and Notion isn't configured, use placeholders.
 
     Idempotent: repeated calls with the same `notion_page_id` return the
-    existing bug row unchanged.
+    existing bug row unchanged regardless of which branch above fires.
     """
+    caller_supplied_fields = body.title is not None or body.description is not None
+
+    # Defaults — used if no Notion fetch happens or it fails.
     title = body.title or f"Bug {body.notion_page_id}"
     description = body.description or "(manually enqueued, no Notion fetch)"
+    repro_steps: str | None = None
+    severity: str | None = None
+    reporter: str | None = None
+
+    if not caller_supplied_fields:
+        fetched = _try_fetch_notion_page(body.notion_page_id)
+        if fetched is not None:
+            title = str(fetched.get("title") or title)
+            description = str(fetched.get("description") or description)
+            repro_steps = fetched.get("repro_steps")  # type: ignore[assignment]
+            severity = fetched.get("severity")  # type: ignore[assignment]
+            reporter = fetched.get("reporter")  # type: ignore[assignment]
+
     bug = repo.create_bug(
         session,
         notion_page_id=body.notion_page_id,
         project_id=body.project_id,
         title=title,
         description=description,
+        repro_steps=repro_steps,
+        severity=severity,
+        reporter=reporter,
     )
     current_test = repo.get_current_test_instance(session)
     launched_bug_id = current_test.bug_id if current_test else None

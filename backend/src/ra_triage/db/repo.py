@@ -150,6 +150,9 @@ def update_bug_state(session: Session, bug: Bug, new_state: BugState) -> Bug:
       state.
     - Publishes a `state_change` event on the bug's topic and on the queue
       topic.
+    - Calls the Notion write-back post-transition hook (Agent 3). Failures
+      in that side effect MUST NOT roll back the transition; the hook
+      swallows all errors internally.
     """
     previous = BugState(bug.state)
     transition(previous, new_state)
@@ -161,7 +164,30 @@ def update_bug_state(session: Session, bug: Bug, new_state: BugState) -> Bug:
     session.flush()
 
     _publish_state_change(bug, previous.value, new_state.value)
+    _post_transition_hook(bug, new_state)
     return bug
+
+
+def _post_transition_hook(bug: Bug, new_state: BugState) -> None:
+    """Single post-transition side-effect entry point.
+
+    Kept as a thin dispatch so new side effects land here (not sprinkled
+    through callers). Currently: Notion status write-back only.
+
+    All side effects are best-effort: this function never raises. The
+    individual helpers log their own failures.
+    """
+    # Deferred import avoids a module-level cycle:
+    #   integrations.notion imports orchestrator.states, which is imported
+    #   by this file. Import at call time instead.
+    try:
+        from ra_triage.integrations.notion import status_writeback_for_state
+    except Exception:  # pragma: no cover - defensive only
+        return
+    try:
+        status_writeback_for_state(bug, new_state)
+    except Exception:  # pragma: no cover - the hook already swallows
+        pass
 
 
 # --- AgentRun ----------------------------------------------------------------

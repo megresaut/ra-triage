@@ -221,10 +221,17 @@ class NotionPoller:
         return ingested
 
     def _ingest_one(self, project: ProjectConfig, normalized: Any) -> None:
-        """Open a session, call `create_bug` idempotently, commit."""
+        """Open a session, call `create_bug` idempotently, commit.
+
+        After a successful insert (or a no-op on an existing row), schedule
+        ``run_pipeline(bug.id)`` on the bus's attached loop. We capture the
+        bug.id inside the session and schedule AFTER the commit so the
+        pipeline sees the row. For already-existing bugs we still schedule
+        — the pipeline itself short-circuits on terminal state.
+        """
         session = engine_module.SessionLocal()
         try:
-            repo.create_bug(
+            bug = repo.create_bug(
                 session,
                 notion_page_id=normalized.notion_page_id,
                 project_id=project.id,
@@ -235,11 +242,64 @@ class NotionPoller:
                 reporter=normalized.reporter,
             )
             session.commit()
+            bug_id = int(bug.id)
         except Exception:
             session.rollback()
             raise
         finally:
             session.close()
+
+        self._schedule_pipeline(bug_id)
+
+    def _schedule_pipeline(self, bug_id: int) -> None:
+        """Dispatch ``run_pipeline(bug_id)`` onto the bus's attached loop.
+
+        The poller itself runs on a thread under APScheduler's
+        AsyncIOScheduler — scheduling via the bus's captured loop is the
+        same pattern ``EventBus.publish_sync`` uses. Never raises; a
+        failure to schedule just logs + moves on (the next poll tick
+        re-creates the bug idempotently and re-schedules).
+        """
+        # Deferred import: pipeline imports agents/, agents/ imports
+        # settings, and settings is already loaded by the poller. This
+        # avoids a module-load-time cycle through integrations.
+        try:
+            from ra_triage.orchestrator.pipeline import run_pipeline
+            from ra_triage.utils.events import bus
+        except Exception:
+            logger.exception(
+                "Notion poller: failed to import pipeline; cannot schedule bug %d",
+                bug_id,
+            )
+            return
+
+        loop = bus.get_loop()
+        if loop is None:
+            # No attached loop (e.g. tests running poll_once outside the
+            # app lifespan). Skipping is safe — the pipeline is scheduled
+            # again the next time FastAPI sees this bug.
+            logger.debug(
+                "Notion poller: no loop attached; skipping pipeline dispatch for bug %d",
+                bug_id,
+            )
+            return
+
+        target_loop = loop
+
+        def _schedule() -> None:
+            try:
+                target_loop.create_task(run_pipeline(bug_id))
+            except Exception:
+                logger.exception(
+                    "Notion poller: failed to create_task for bug %d", bug_id
+                )
+
+        try:
+            target_loop.call_soon_threadsafe(_schedule)
+        except RuntimeError:
+            logger.exception(
+                "Notion poller: call_soon_threadsafe failed for bug %d", bug_id
+            )
 
     # -- failure tracking -------------------------------------------------
 

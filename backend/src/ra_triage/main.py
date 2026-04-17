@@ -19,6 +19,7 @@ from ra_triage.api.bugs import router as bugs_router
 from ra_triage.api.projects import router as projects_router
 from ra_triage.api.ws import router as ws_router
 from ra_triage.integrations.notion_poller import NotionPoller
+from ra_triage.orchestrator.resume import resume_inflight
 from ra_triage.settings import get_settings
 from ra_triage.utils.events import bus
 
@@ -38,6 +39,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         bus.attach_loop(asyncio.get_running_loop())
     except RuntimeError:
         pass
+
+    # Agent 5: log any non-terminal bugs that existed before restart.
+    # Agent 12 will replace this with real pipeline re-spawn.
+    try:
+        await resume_inflight()
+    except Exception:
+        logger.exception("resume_inflight failed during lifespan startup")
 
     poller = NotionPoller()
     poller.start()

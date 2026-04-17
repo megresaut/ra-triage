@@ -115,3 +115,35 @@ export async function enqueueBug(
 ): Promise<Bug> {
   return apiPost<Bug, PollerEnqueueRequest>("/poller/enqueue", body, { signal });
 }
+
+// --- Agent 5 additions ---------------------------------------------------
+
+/** Parsed TRIAGE.md payload. Shape mirrors TriageResponse on the backend. */
+export interface TriageSections {
+  sections: Record<string, string>;
+  raw: string;
+  path: string;
+}
+
+export async function fetchTriage(
+  bugId: number,
+  signal?: AbortSignal,
+): Promise<TriageSections> {
+  return apiGet<TriageSections>(`/bugs/${bugId}/triage`, { signal });
+}
+
+/** URL to the rendered prompt file for a specific agent run. */
+export function promptUrl(
+  bugId: number,
+  role: string,
+  attempt: number,
+): string {
+  const params = new URLSearchParams({ role, attempt: String(attempt) });
+  return `${BACKEND_BASE_URL}/bugs/${bugId}/prompt?${params.toString()}`;
+}
+
+/** WebSocket URL for per-bug live log frames. */
+export function bugLogsWsUrl(bugId: number): string {
+  // Same host as backend REST; ``ws://`` scheme for the local dev.
+  return `ws://127.0.0.1:5000/ws/bugs/${bugId}/logs`;
+}

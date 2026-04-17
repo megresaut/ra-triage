@@ -21,14 +21,23 @@ Design choices:
 The Scope section uses a specific ``key: value`` shape the Investigator
 writes per the prompt template (tech plan §9.1). ``get_scope`` extracts it
 into a typed dict that the pipeline uses for state routing.
+
+The Escalation Brief uses a structured bulleted shape (tech plan §9.1 /
+product plan "Escalation Brief"). ``parse_escalation_brief`` walks those
+bullets into a :class:`ParsedBrief` that the API + frontend action flow
+consumes directly (Agent 9). The parser is deliberately tolerant: missing
+sub-fields collapse to ``None``, and the ``options`` list is ALWAYS
+normalized to (approve_recommended, alternative_1..N, take_over) in that
+order regardless of the agent's prose.
 """
 
 from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # Matches an ATX ``## Heading`` line. Must be at line start; trailing
 # whitespace is tolerated. ``###`` and deeper headings are deliberately
@@ -194,9 +203,271 @@ def has_escalation(sections: dict[str, str]) -> bool:
     return bool(body.strip())
 
 
+# --- Escalation Brief parsing ------------------------------------------------
+
+#: Regex that matches the ``- **<Field>:**`` anchor the Investigator emits.
+#: The field name is captured lowercased for case-insensitive dispatch. We
+#: allow optional trailing text on the same line (the start of the body)
+#: because the Investigator's prompt template shows both shapes.
+_ESCALATION_FIELD_LINE = re.compile(
+    r"^\s*-\s*\*\*(?P<field>[^*:]+?)\s*:\*\*\s*(?P<rest>.*)$"
+)
+
+#: Regex that detects an Alternative N anchor inside the Ranked alternatives
+#: body. Used to split the blob into per-alternative bodies.
+_ALTERNATIVE_ANCHOR = re.compile(
+    r"^\s*-\s*\*\*Alternative\s+(?P<n>\d+)\s*:\*\*\s*(?P<rest>.*)$",
+    re.IGNORECASE,
+)
+
+#: Regex that detects a bullet line inside a field body (used to extract
+#: file-path lists). Matches ``- <content>`` with optional leading spaces.
+_BULLET_LINE = re.compile(r"^\s*-\s+(?P<content>.+?)\s*$")
+
+#: Aliases that map the Investigator's prose labels to the ``ParsedBrief``
+#: attribute name. Lowercased on comparison. Kept explicit so a reshuffled
+#: prompt wording doesn't silently drop a field.
+_FIELD_ALIASES: dict[str, str] = {
+    "tl;dr": "tldr",
+    "tldr": "tldr",
+    "why blocked": "why_blocked",
+    "why this is blocked": "why_blocked",
+    "the bug": "the_bug",
+    "why the change is necessary": "why_change_necessary",
+    "why the escalation-triggering change is necessary": "why_change_necessary",
+    "why change necessary": "why_change_necessary",
+    "proposed approach": "proposed_approach",
+    "ranked alternatives": "ranked_alternatives",
+    "what i need from you": "_what_i_need",  # not surfaced as an attr
+    "files that would be touched": "files_that_would_be_touched",
+    "test plan": "test_plan",
+}
+
+
+@dataclass(frozen=True)
+class ParsedBriefOption:
+    """One option the reviewer can pick on an escalated bug."""
+
+    id: str  # "approve_recommended" | f"alternative_{N}" | "take_over"
+    label: str
+    kind: Literal["approve", "alternative", "take_over"]
+
+
+@dataclass(frozen=True)
+class ParsedBrief:
+    """Structured view of the Investigator's ``## Escalation Brief`` body."""
+
+    raw: str
+    tldr: str | None = None
+    why_blocked: str | None = None
+    the_bug: str | None = None
+    why_change_necessary: str | None = None
+    proposed_approach: str | None = None
+    ranked_alternatives: list[str] = field(default_factory=list)
+    files_that_would_be_touched: list[str] = field(default_factory=list)
+    test_plan: str | None = None
+    options: list[ParsedBriefOption] = field(default_factory=list)
+
+
+def parse_escalation_brief(sections: dict[str, str]) -> ParsedBrief | None:
+    """Parse the ``Escalation Brief`` section into a :class:`ParsedBrief`.
+
+    Returns ``None`` if the section is absent or empty. Missing sub-fields
+    return as ``None`` / empty lists on the result; the ``raw`` attribute
+    always holds the original body verbatim so the UI can fall back to a
+    full markdown render.
+
+    Parsing strategy: we scan the body line-by-line collecting ``- **<Field>:**``
+    anchors. Each anchor opens a new field; subsequent lines that are not
+    anchors (and not blank-before-anchor) are appended to the current
+    field's body. ``Ranked alternatives`` is a special case — its body is
+    further split on ``- **Alternative N:**`` markers into a list of
+    per-alternative bodies. ``Files that would be touched`` has its bullets
+    extracted into a flat string list.
+
+    The ``options`` list is always synthesized in canonical order (approve
+    first, alternatives next in ascending N, take-over last) regardless of
+    what the Investigator wrote under "What I need from you" — the
+    Investigator's prose drives the alternative labels, but the order and
+    identifiers are orchestrator-controlled so the API + frontend have a
+    stable contract.
+    """
+    body = sections.get("Escalation Brief")
+    if body is None:
+        return None
+    if not body.strip():
+        return None
+
+    fields = _collect_field_bodies(body)
+    alternatives = _split_alternatives(fields.get("ranked_alternatives", ""))
+    files_list = _extract_bulleted_lines(fields.get("files_that_would_be_touched", ""))
+    options = _build_options(alternatives)
+
+    return ParsedBrief(
+        raw=body,
+        tldr=_nonempty(fields.get("tldr")),
+        why_blocked=_nonempty(fields.get("why_blocked")),
+        the_bug=_nonempty(fields.get("the_bug")),
+        why_change_necessary=_nonempty(fields.get("why_change_necessary")),
+        proposed_approach=_nonempty(fields.get("proposed_approach")),
+        ranked_alternatives=alternatives,
+        files_that_would_be_touched=files_list,
+        test_plan=_nonempty(fields.get("test_plan")),
+        options=options,
+    )
+
+
+def _collect_field_bodies(body: str) -> dict[str, str]:
+    """Walk the brief body, collecting each ``- **<Field>:**`` block.
+
+    Lines after an anchor (up to the next anchor) are treated as the
+    field's body. Blank lines before the first anchor are discarded.
+    Unknown field labels are dropped silently — they never land in the
+    returned dict — but their body text DOES continue to accumulate under
+    them internally so subsequent continuation lines don't leak into the
+    previous known field.
+    """
+    collected: dict[str, list[str]] = {}
+    current_attr: str | None = None
+    current_lines: list[str] = []
+
+    def _flush() -> None:
+        if current_attr is None:
+            return
+        text = "\n".join(current_lines).strip()
+        # Preserve the LAST write for duplicate fields — agents shouldn't
+        # emit duplicates, but if they do, we behave predictably.
+        collected[current_attr] = [text]
+
+    for raw_line in body.splitlines():
+        match = _ESCALATION_FIELD_LINE.match(raw_line)
+        # Only treat a line as a TOP-LEVEL field anchor if its label is in
+        # the known alias table. Unknown labels (e.g. "Alternative 1")
+        # are allowed to be continuation text for the current field —
+        # this lets "Ranked alternatives" wrap nested alternative bullets
+        # without us closing the parent field prematurely.
+        if match:
+            field_label = match.group("field").strip().lower()
+            if field_label in _FIELD_ALIASES:
+                _flush()
+                current_attr = _FIELD_ALIASES[field_label]
+                rest = match.group("rest").strip()
+                current_lines = [rest] if rest else []
+                continue
+        if current_attr is None:
+            # Unanchored lines before the first known field — ignore.
+            continue
+        current_lines.append(raw_line)
+
+    _flush()
+    # Drop unknown fields (they're stored under None-mapped aliases we don't
+    # care about, e.g. "_what_i_need").
+    return {k: v[0] for k, v in collected.items() if not k.startswith("_")}
+
+
+def _split_alternatives(blob: str) -> list[str]:
+    """Split a ranked-alternatives blob on ``- **Alternative N:**`` anchors.
+
+    Returns a list of bodies (one per alternative). Leading preamble
+    before the first anchor is discarded — it's typically empty, and the
+    Investigator prompt template shows the anchor as the first line.
+    Alternatives are ordered by their N (ascending) to match the options
+    list the orchestrator synthesizes.
+    """
+    if not blob.strip():
+        return []
+
+    # Pass 1: scan for anchors, recording (N, start_line) pairs.
+    lines = blob.splitlines()
+    anchors: list[tuple[int, int, str]] = []  # (n, line_idx, rest_of_anchor_line)
+    for idx, raw_line in enumerate(lines):
+        m = _ALTERNATIVE_ANCHOR.match(raw_line)
+        if m:
+            try:
+                n_value = int(m.group("n"))
+            except ValueError:
+                continue
+            anchors.append((n_value, idx, m.group("rest")))
+
+    if not anchors:
+        return []
+
+    # Pass 2: slice each alternative's body from its anchor to the next.
+    bodies: list[tuple[int, str]] = []
+    for i, (n, start, rest) in enumerate(anchors):
+        end = anchors[i + 1][1] if i + 1 < len(anchors) else len(lines)
+        continuation = "\n".join(lines[start + 1 : end])
+        combined_parts: list[str] = []
+        if rest.strip():
+            combined_parts.append(rest.strip())
+        if continuation.strip():
+            combined_parts.append(continuation.rstrip())
+        body = "\n".join(combined_parts).strip()
+        bodies.append((n, body))
+
+    bodies.sort(key=lambda pair: pair[0])
+    return [body for _n, body in bodies]
+
+
+def _extract_bulleted_lines(blob: str) -> list[str]:
+    """Return the trimmed text of every ``- <content>`` line in ``blob``.
+
+    Used for the "Files that would be touched" field so callers get a
+    flat list of paths. Non-bullet lines are ignored.
+    """
+    if not blob.strip():
+        return []
+    out: list[str] = []
+    for raw_line in blob.splitlines():
+        m = _BULLET_LINE.match(raw_line)
+        if m:
+            content = m.group("content").strip()
+            if content:
+                out.append(content)
+    return out
+
+
+def _build_options(alternatives: list[str]) -> list[ParsedBriefOption]:
+    """Synthesize the canonical options list in stable order."""
+    options: list[ParsedBriefOption] = [
+        ParsedBriefOption(
+            id="approve_recommended",
+            label="Approve Recommended",
+            kind="approve",
+        )
+    ]
+    for idx in range(1, len(alternatives) + 1):
+        options.append(
+            ParsedBriefOption(
+                id=f"alternative_{idx}",
+                label=f"Pick Alternative {idx}",
+                kind="alternative",
+            )
+        )
+    options.append(
+        ParsedBriefOption(
+            id="take_over",
+            label="Take Over Manually",
+            kind="take_over",
+        )
+    )
+    return options
+
+
+def _nonempty(value: str | None) -> str | None:
+    """Return ``value`` stripped, or ``None`` if it's empty / whitespace."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 __all__ = [
+    "ParsedBrief",
+    "ParsedBriefOption",
     "append",
     "get_scope",
     "has_escalation",
     "parse",
+    "parse_escalation_brief",
 ]

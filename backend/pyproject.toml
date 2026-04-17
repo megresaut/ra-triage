@@ -54,7 +54,8 @@ extend-exclude = ["alembic/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "B", "UP"]
-ignore = ["E501"]
+# B008 is idiomatic in FastAPI (Depends/Query as argument defaults).
+ignore = ["E501", "B008"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -76,3 +77,7 @@ addopts = "-ra -q"
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+# Suppress pytest's "Test*" class collection — we use only function-based
+# tests, and one of our ORM models (TestInstance) otherwise trips the
+# collector with an "__init__ not allowed" warning.
+python_classes = []

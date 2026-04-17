@@ -1,9 +1,12 @@
 """Per-bug pipeline driver.
 
 ``run_pipeline(bug_id)`` advances a bug through the state machine,
-spawning agents as needed. Agent 5 implements only the slice from OPEN
-→ TRIAGED → INVESTIGATING → (BLOCKED | READY_FOR_REVIEW stub). Later
-agents (6, 10) fill in FIXING/TESTING and DESIGNING/FIXING_PARALLEL.
+spawning agents as needed. Agent 5 implemented OPEN → TRIAGED →
+INVESTIGATING → (BLOCKED | READY_FOR_REVIEW stub). Agent 6 fills in the
+single-repo happy path: INVESTIGATING (scope=single-repo) → FIXING →
+TESTING → READY_FOR_REVIEW, with BLOCKED transitions on Fixer/Tester
+failure and on Tester prod-file safety violations. Agent 10 fills in
+the cross-repo path.
 
 Key invariants:
   - Every state transition goes through ``db.repo.update_bug_state``
@@ -32,12 +35,14 @@ from pathlib import Path
 from typing import Any
 
 from ra_triage.agents.base import AgentResult
+from ra_triage.agents.fixer import Fixer
 from ra_triage.agents.investigator import Investigator
+from ra_triage.agents.tester import Tester
 from ra_triage.config.registry import ProjectConfig, RepoConfig, get_project
 from ra_triage.db import engine as engine_module
 from ra_triage.db import repo as repo_module
 from ra_triage.db.models import AgentRun, Bug
-from ra_triage.orchestrator import concurrency
+from ra_triage.orchestrator import concurrency, tester_safety
 from ra_triage.orchestrator.states import (
     TERMINAL_STATES,
     BugState,
@@ -279,12 +284,14 @@ async def _route_after_investigator(
         return
 
     if scope["scope"] == "single-repo":
-        logger.warning(
-            "Agent 5 stub: single-repo happy path not yet implemented — "
-            "marking bug %d READY_FOR_REVIEW directly (Agent 6 fills in FIXING/TESTING)",
-            bug_id,
+        # Agent 6: real single-repo happy path. Drives INVESTIGATING →
+        # FIXING → TESTING → READY_FOR_REVIEW (or BLOCKED on failure).
+        await _run_single_repo_fix_and_test(
+            bug_id=bug_id,
+            project=project,
+            scope=scope,
+            triage_md_path=triage_md_path,
         )
-        await _stub_advance_through_fixing_testing(bug_id)
         return
 
     if scope["scope"] == "cross-repo":
@@ -315,18 +322,368 @@ async def _route_after_investigator(
     await _transition(bug_id, BugState.BLOCKED)
 
 
-async def _stub_advance_through_fixing_testing(bug_id: int) -> None:
-    """Stub for Agent 6: advance INVESTIGATING → FIXING → TESTING → READY_FOR_REVIEW.
+async def _run_single_repo_fix_and_test(
+    *,
+    bug_id: int,
+    project: ProjectConfig,
+    scope: dict[str, Any],
+    triage_md_path: Path,
+) -> None:
+    """Drive INVESTIGATING → FIXING → TESTING → READY_FOR_REVIEW (or BLOCKED).
 
-    Agents 5's acceptance criteria calls for the bug to land in
-    READY_FOR_REVIEW when scope is single-repo and there is no escalation.
-    The real happy path runs the Fixer + Tester; we short-circuit through
-    the intermediate states because the state machine doesn't allow a direct
-    INVESTIGATING → READY_FOR_REVIEW transition.
+    Single-repo only. Picks the single affected repo from the
+    Investigator's Scope section, runs the Fixer, then the Tester. On
+    any failure (Fixer failed/escalated, Tester failed, Tester
+    produced a prod-code modification that would have violated the
+    test-files-only constraint), the bug lands in BLOCKED with the
+    relevant diagnostic section appended to TRIAGE.md.
     """
+    # Resolve the single affected repo. If the Investigator listed zero
+    # repos or more than one, bail to BLOCKED with a clear reason —
+    # cross-repo is Agent 10's scope.
+    picked = _pick_single_affected_repo(project, scope)
+    if picked is None:
+        triage_parser.append(
+            triage_md_path,
+            "Escalation Brief",
+            "- **TL;DR:** Investigator's Scope section listed no affected "
+            "repos; cannot proceed with single-repo fix.\n"
+            "- **What I need from you:** Re-investigate or take over manually.",
+        )
+        await _transition(bug_id, BugState.BLOCKED)
+        return
+    if picked == _MULTIPLE_REPOS_SENTINEL:
+        triage_parser.append(
+            triage_md_path,
+            "Escalation Brief",
+            "- **TL;DR:** Investigator produced scope=single-repo but listed "
+            "multiple affected repos; routing the bug requires cross-repo "
+            "support (Agent 10).\n"
+            "- **What I need from you:** Re-investigate with a scope that "
+            "matches the repo list, or take over manually.",
+        )
+        await _transition(bug_id, BugState.BLOCKED)
+        return
+
+    # Narrow type for mypy: picked is now definitely a RepoConfig.
+    assert isinstance(picked, RepoConfig)
+    repo_config: RepoConfig = picked
+    worktree = wt_module.path_for(bug_id, repo_config.name)
+
+    # ---- FIXING ---------------------------------------------------
     await _transition(bug_id, BugState.FIXING)
+    bug_snapshot = await _load_bug(bug_id)
+    if bug_snapshot is None or _is_terminal(bug_snapshot["state"]):
+        return
+
+    fixer_result = await _run_fixer(
+        bug_id=bug_id,
+        repo_config=repo_config,
+        worktree=worktree,
+        triage_md_path=triage_md_path,
+    )
+
+    # Post-Fixer routing. We check both the completion token and the
+    # presence of a ``## Fixer Escalation`` section — the Fixer may have
+    # stopped without printing FIXER_FAILED if it decided the fix
+    # required a deny-list path change.
+    sections_after_fix = triage_parser.parse(triage_md_path)
+    if _has_fixer_escalation(sections_after_fix):
+        logger.info(
+            "Fixer for bug %d raised escalation — routing to BLOCKED", bug_id
+        )
+        await _transition(bug_id, BugState.BLOCKED)
+        return
+
+    if fixer_result.completion_token != "FIXER_COMPLETE":
+        logger.info(
+            "Fixer for bug %d did not report success (token=%s) — BLOCKED",
+            bug_id,
+            fixer_result.completion_token,
+        )
+        # If the agent crashed without writing a ## Fixer Failure
+        # section, append one so the UI has context.
+        if not _has_fixer_failure(sections_after_fix):
+            triage_parser.append(
+                triage_md_path,
+                "Fixer Failure",
+                (
+                    "- **Completion token:** "
+                    f"{fixer_result.completion_token or '(none observed — crash)'}\n"
+                    f"- **Exit code:** {fixer_result.exit_code}\n"
+                    f"- **Log:** {fixer_result.log_path}\n"
+                ),
+            )
+        await _transition(bug_id, BugState.BLOCKED)
+        return
+
+    # ---- TESTING --------------------------------------------------
+    bug_snapshot = await _load_bug(bug_id)
+    if bug_snapshot is None or _is_terminal(bug_snapshot["state"]):
+        return
     await _transition(bug_id, BugState.TESTING)
-    await _transition(bug_id, BugState.READY_FOR_REVIEW)
+    bug_snapshot = await _load_bug(bug_id)
+    if bug_snapshot is None or _is_terminal(bug_snapshot["state"]):
+        return
+
+    # Capture the post-Fixer baseline as ``{path: content_hash}``. The
+    # safety check compares each post-Tester path's hash against this
+    # map: files the Tester didn't modify are skipped, files the Tester
+    # changed (or created new) are inspected. Without this, the Fixer's
+    # own uncommitted prod edits would trip the "Tester wrote prod
+    # code" guard.
+    pre_tester_baseline = await tester_safety.snapshot_working_tree(worktree)
+
+    tester_result = await _run_tester(
+        bug_id=bug_id,
+        repo_config=repo_config,
+        worktree=worktree,
+        triage_md_path=triage_md_path,
+    )
+
+    # Post-Tester safety check: revert any prod-file modifications and
+    # block if one was detected. Runs BEFORE we interpret the completion
+    # token because a violation always wins — we want to keep the
+    # orchestrator-side guarantee that the Tester's branch contains only
+    # test-file additions (and the Fixer's pre-existing changes).
+    safety = await tester_safety.check_and_revert_prod_changes(
+        worktree, baseline=pre_tester_baseline
+    )
+    if safety.had_violation:
+        logger.warning(
+            "Tester for bug %d modified %d prod file(s); reverting and BLOCKING",
+            bug_id,
+            len(safety.reverted_paths),
+        )
+        _append_tester_safety_violation(triage_md_path, safety)
+        await _transition(bug_id, BugState.BLOCKED)
+        return
+
+    if tester_result.completion_token == "TESTER_COMPLETE":
+        await _transition(bug_id, BugState.READY_FOR_REVIEW)
+        return
+
+    # TESTER_FAILED or crash.
+    logger.info(
+        "Tester for bug %d did not report success (token=%s) — BLOCKED",
+        bug_id,
+        tester_result.completion_token,
+    )
+    sections_after_test = triage_parser.parse(triage_md_path)
+    if not _has_tester_failure(sections_after_test):
+        triage_parser.append(
+            triage_md_path,
+            "Tester Failure",
+            (
+                "- **Completion token:** "
+                f"{tester_result.completion_token or '(none observed — crash)'}\n"
+                f"- **Exit code:** {tester_result.exit_code}\n"
+                f"- **Log:** {tester_result.log_path}\n"
+            ),
+        )
+    await _transition(bug_id, BugState.BLOCKED)
+
+
+# --- Fixer / Tester agent drivers ---------------------------------------
+
+
+async def _run_fixer(
+    *,
+    bug_id: int,
+    repo_config: RepoConfig,
+    worktree: Path,
+    triage_md_path: Path,
+) -> AgentResult:
+    """Spawn the Fixer, record its agent_runs row, return the result."""
+    attempt = await _next_attempt(bug_id, role="fixer")
+    started_at = _utcnow()
+
+    run_id = await _insert_agent_run_start(
+        bug_id=bug_id,
+        role="fixer",
+        attempt=attempt,
+        started_at=started_at,
+        log_path=_predicted_log_path(bug_id, "fixer", attempt),
+        prompt_path=_predicted_prompt_path(bug_id, "fixer", attempt),
+        worktree_repo=repo_config.name,
+    )
+
+    bug = await _load_bug_row(bug_id)
+    if bug is None:
+        raise RuntimeError(f"Bug {bug_id} vanished mid-pipeline")
+
+    project = get_project(bug["project_id"])
+
+    context: dict[str, Any] = {
+        "bug": {
+            "id": bug["id"],
+            "title": bug["title"],
+        },
+        "worktree_path": str(worktree),
+        "build_command": repo_config.build_command,
+        "deny_list": {
+            "paths": list(project.deny_list.paths),
+            "categories": list(project.deny_list.categories),
+        },
+        # Agent 9 will set ``escalation_context`` via the approve flow.
+        # Keep the key present (None) so StrictUndefined doesn't trip.
+        "escalation_context": None,
+        "attempt": attempt,
+    }
+
+    fixer = Fixer()
+    result = await fixer.run(
+        bug=_BugView(**bug),
+        worktree=worktree,
+        context=context,
+    )
+
+    await _finalize_agent_run(
+        run_id=run_id,
+        ended_at=result.ended_at,
+        exit_code=result.exit_code,
+        completion_token=result.completion_token,
+        log_path=result.log_path,
+        prompt_path=result.prompt_path,
+        triage_md_snapshot=result.triage_md,
+    )
+
+    return result
+
+
+async def _run_tester(
+    *,
+    bug_id: int,
+    repo_config: RepoConfig,
+    worktree: Path,
+    triage_md_path: Path,
+) -> AgentResult:
+    """Spawn the Tester, record its agent_runs row, return the result."""
+    attempt = await _next_attempt(bug_id, role="tester")
+    started_at = _utcnow()
+
+    run_id = await _insert_agent_run_start(
+        bug_id=bug_id,
+        role="tester",
+        attempt=attempt,
+        started_at=started_at,
+        log_path=_predicted_log_path(bug_id, "tester", attempt),
+        prompt_path=_predicted_prompt_path(bug_id, "tester", attempt),
+        worktree_repo=repo_config.name,
+    )
+
+    bug = await _load_bug_row(bug_id)
+    if bug is None:
+        raise RuntimeError(f"Bug {bug_id} vanished mid-pipeline")
+
+    context: dict[str, Any] = {
+        "bug": {
+            "id": bug["id"],
+            "title": bug["title"],
+        },
+        "worktree_path": str(worktree),
+        "test_command": repo_config.test_command,
+        "test_database_url": repo_config.test_database_url or "(not configured)",
+        "triage_md_path": str(triage_md_path),
+        "attempt": attempt,
+    }
+
+    tester = Tester()
+    result = await tester.run(
+        bug=_BugView(**bug),
+        worktree=worktree,
+        context=context,
+    )
+
+    await _finalize_agent_run(
+        run_id=run_id,
+        ended_at=result.ended_at,
+        exit_code=result.exit_code,
+        completion_token=result.completion_token,
+        log_path=result.log_path,
+        prompt_path=result.prompt_path,
+        triage_md_snapshot=result.triage_md,
+    )
+
+    return result
+
+
+# --- Routing helpers ----------------------------------------------------
+
+
+#: Sentinel returned by :func:`_pick_single_affected_repo` when the Scope
+#: section listed more than one affected repo (which is inconsistent with
+#: ``scope: single-repo`` but we guard against it).
+_MULTIPLE_REPOS_SENTINEL = "__multiple__"
+
+
+def _pick_single_affected_repo(
+    project: ProjectConfig, scope: dict[str, Any]
+) -> RepoConfig | str | None:
+    """Resolve the single repo the Fixer should target.
+
+    Returns:
+      - a ``RepoConfig`` on exactly one match against the project registry.
+      - the string :data:`_MULTIPLE_REPOS_SENTINEL` if the Scope section
+        lists more than one repo.
+      - ``None`` on zero / unknown repo names.
+    """
+    affected = [str(r).strip() for r in scope.get("affected_repos", []) if str(r).strip()]
+    if not affected:
+        # Fall back to the project's single repo if unambiguous.
+        if len(project.repos) == 1:
+            return project.repos[0]
+        return None
+    if len(affected) > 1:
+        return _MULTIPLE_REPOS_SENTINEL
+    name = affected[0]
+    for repo in project.repos:
+        if repo.name == name:
+            return repo
+    return None
+
+
+def _has_fixer_failure(sections: dict[str, str]) -> bool:
+    return bool(sections.get("Fixer Failure", "").strip())
+
+
+def _has_fixer_escalation(sections: dict[str, str]) -> bool:
+    return bool(sections.get("Fixer Escalation", "").strip())
+
+
+def _has_tester_failure(sections: dict[str, str]) -> bool:
+    return bool(sections.get("Tester Failure", "").strip())
+
+
+def _append_tester_safety_violation(
+    triage_md_path: Path,
+    safety: tester_safety.SafetyCheckResult,
+) -> None:
+    """Write a ``## Tester Safety Violation`` section summarizing the revert."""
+    lines: list[str] = [
+        "The Tester modified production code (not allowed by the test-files-only "
+        "constraint). The orchestrator reverted the offending files below so the "
+        "branch contains only test-file additions. The bug is BLOCKED; re-run the "
+        "Tester or take over manually.",
+        "",
+        "**Reverted prod files:**",
+    ]
+    if safety.reverted_paths:
+        for p in safety.reverted_paths:
+            lines.append(f"- `{p}`")
+    else:
+        lines.append("- (none reverted successfully)")
+    if safety.revert_errors:
+        lines.append("")
+        lines.append("**Revert errors (file still dirty):**")
+        for path, err in safety.revert_errors:
+            lines.append(f"- `{path}`: {err}")
+    if safety.test_paths:
+        lines.append("")
+        lines.append("**Test-file changes kept:**")
+        for p in safety.test_paths:
+            lines.append(f"- `{p}`")
+    triage_parser.append(triage_md_path, "Tester Safety Violation", "\n".join(lines))
 
 
 async def _stub_advance_through_cross_repo(bug_id: int) -> None:
@@ -467,6 +824,7 @@ async def _insert_agent_run_start(
     started_at: datetime,
     log_path: Path,
     prompt_path: Path,
+    worktree_repo: str | None = None,
 ) -> int:
     return await asyncio.to_thread(
         _insert_agent_run_start_sync,
@@ -476,6 +834,7 @@ async def _insert_agent_run_start(
         started_at,
         str(log_path),
         str(prompt_path),
+        worktree_repo,
     )
 
 
@@ -486,6 +845,7 @@ def _insert_agent_run_start_sync(
     started_at: datetime,
     log_path: str,
     prompt_path: str,
+    worktree_repo: str | None,
 ) -> int:
     session = engine_module.SessionLocal()
     try:
@@ -497,6 +857,7 @@ def _insert_agent_run_start_sync(
             started_at=started_at,
             log_path=log_path,
             prompt_path=prompt_path,
+            worktree_repo=worktree_repo,
         )
         session.commit()
         return int(run.id)

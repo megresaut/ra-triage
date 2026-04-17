@@ -198,6 +198,256 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/bugs/{bug_id}/diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Bug Diff
+         * @description Return the unified diff of the bug's worktree vs ``origin/<main>``.
+         *
+         *     Strategy: locate the bug, resolve the repo via the project registry,
+         *     derive the worktree path via ``workspaces.worktree.path_for``. 404 if
+         *     the worktree doesn't exist on disk (pipeline hasn't started, bug was
+         *     cleaned up, or the repo name is wrong). Runs ``git diff --no-color
+         *     origin/<main_branch>`` in the worktree and returns stdout verbatim.
+         *
+         *     On a git failure we surface the stderr as a 500 — the frontend
+         *     renders the error text so operators can act.
+         */
+        get: operations["get_bug_diff_bugs__bug_id__diff_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/diff/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Bug Diff Summary
+         * @description Return ``{files_changed, insertions, deletions}`` from ``git diff --shortstat``.
+         *
+         *     Cheaper than fetching the full diff; useful for the queue view.
+         */
+        get: operations["get_bug_diff_summary_bugs__bug_id__diff_summary_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm Bug Endpoint
+         * @description Confirm the bug's fix — kicks off the merge pipeline.
+         *
+         *     Validates the bug is in ``READY_FOR_REVIEW`` (409 otherwise). Returns
+         *     202 immediately; the merge itself runs as a background task via
+         *     :func:`orchestrator.merge.merge_bug`. The frontend subscribes to the
+         *     bug's state channel to observe MERGING → FIXED or MERGING → BLOCKED.
+         */
+        post: operations["confirm_bug_endpoint_bugs__bug_id__confirm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reject Bug Endpoint
+         * @description Reject the current READY_FOR_REVIEW fix.
+         *
+         *     Records the rejection row (bumps ``rejection_count``) and either:
+         *       - bumps to the rejection limit → transition to BLOCKED and append a
+         *         ``## Rejection Limit Reached`` section to TRIAGE.md listing every
+         *         reason collected for this bug.
+         *       - otherwise → transition back to INVESTIGATING and schedule
+         *         :func:`orchestrator.pipeline.reinvestigate_with_feedback` with
+         *         this rejection's reason so the Investigator sees it in the
+         *         rendered prompt.
+         *
+         *     409 if the bug isn't in READY_FOR_REVIEW.
+         */
+        post: operations["reject_bug_endpoint_bugs__bug_id__reject_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel Bug Endpoint
+         * @description Cancel the bug. Allowed from any non-terminal state.
+         *
+         *     Transitions to CANCELLED (which also fires Notion status write-back
+         *     to "Won't Fix" via the hook) and cleans up the bug's worktrees. The
+         *     cleanup is best-effort — we swallow errors so the state transition
+         *     always commits.
+         */
+        post: operations["cancel_bug_endpoint_bugs__bug_id__cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry Bug Endpoint
+         * @description Re-run the most recent agent role with ``attempt += 1``.
+         *
+         *     409 if the bug is terminal or if no prior agent run exists, or if the
+         *     latest run doesn't satisfy retry-eligibility (see
+         *     :func:`orchestrator.pipeline.retry_last_agent`).
+         */
+        post: operations["retry_bug_endpoint_bugs__bug_id__retry_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/take-over": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Take Over Bug Endpoint
+         * @description Mark the bug as taken-over manually.
+         *
+         *     Transitions to BLOCKED (so the Notion status flips to "Blocked" via
+         *     the hook) and appends a ``## Taken Over Manually`` marker section to
+         *     TRIAGE.md. Does NOT clean up the worktree — Megha uses it out of
+         *     band.
+         *
+         *     Allowed from any non-terminal state.
+         */
+        post: operations["take_over_bug_endpoint_bugs__bug_id__take_over_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/test-instances/launch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Launch Test Instance
+         * @description Launch a test instance for ``body.bug_id``.
+         *
+         *     If a different bug's instance is currently running, it is stopped first
+         *     before the new one is launched — the lock inside
+         *     :class:`TestInstanceManager` serializes everything.
+         *
+         *     Returns the running snapshot. On failure returns 409 with a structured
+         *     detail body.
+         */
+        post: operations["launch_test_instance_test_instances_launch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/test-instances/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stop Test Instance
+         * @description Stop the current test instance. Returns ``status="none"`` if nothing was running.
+         */
+        post: operations["stop_test_instance_test_instances_stop_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/test-instances/current": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Current Test Instance
+         * @description Return the current running instance or ``204 No Content`` if none.
+         */
+        get: operations["get_current_test_instance_test_instances_current_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -240,6 +490,9 @@ export interface components {
          *     `current_agent` and `conflict_files` are always null in Agent 2's surface
          *     — Agent 5 wires `current_agent` when it tracks the in-flight subprocess,
          *     and Agent 11 wires `conflict_files` when rebase conflicts are recorded.
+         *
+         *     ``pull_requests`` is populated by Agent 8's merge flow (empty list
+         *     until the Confirm button is clicked).
          */
         BugResponse: {
             /** Id */
@@ -289,6 +542,8 @@ export interface components {
              * @default false
              */
             launched_for_testing: boolean;
+            /** Pull Requests */
+            pull_requests?: components["schemas"]["PullRequestResponse"][];
         };
         /**
          * BugState
@@ -298,10 +553,90 @@ export interface components {
          * @enum {string}
          */
         BugState: "OPEN" | "TRIAGED" | "INVESTIGATING" | "DESIGNING" | "FIXING" | "FIXING_PARALLEL" | "TESTING" | "INTEGRATION_TESTING" | "READY_FOR_REVIEW" | "BLOCKED" | "MERGING" | "FIXED" | "WONT_FIX" | "CANCELLED";
+        /**
+         * CancelResponse
+         * @description Response for ``POST /bugs/{bug_id}/cancel``.
+         */
+        CancelResponse: {
+            /** Status */
+            status: string;
+            /** Bug Id */
+            bug_id: number;
+        };
+        /**
+         * ConfirmResponse
+         * @description Response for ``POST /bugs/{bug_id}/confirm``.
+         */
+        ConfirmResponse: {
+            /** Status */
+            status: string;
+            /** Bug Id */
+            bug_id: number;
+        };
+        /**
+         * DiffResponse
+         * @description Unified diff of a bug's worktree vs ``origin/<main_branch>``.
+         */
+        DiffResponse: {
+            /** Repo */
+            repo: string;
+            /** Base Ref */
+            base_ref: string;
+            /** Head Ref */
+            head_ref: string;
+            /** Diff */
+            diff: string;
+        };
+        /**
+         * DiffSummaryResponse
+         * @description Shortstat summary of the Fixer's changes in a worktree.
+         */
+        DiffSummaryResponse: {
+            /** Repo */
+            repo: string;
+            /** Files Changed */
+            files_changed: number;
+            /** Insertions */
+            insertions: number;
+            /** Deletions */
+            deletions: number;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /**
+         * LaunchRequest
+         * @description Body for POST /test-instances/launch.
+         */
+        LaunchRequest: {
+            /** Bug Id */
+            bug_id: number;
+        };
+        /**
+         * LaunchResponse
+         * @description Serializable view of a running instance (matches manager.current()).
+         */
+        LaunchResponse: {
+            /** Bug Id */
+            bug_id: number;
+            /** Status */
+            status: string;
+            /** Ports */
+            ports: {
+                [key: string]: number;
+            };
+            /** Pids */
+            pids: {
+                [key: string]: number;
+            };
+            /** Db Snapshot Hash */
+            db_snapshot_hash?: string | null;
+            /** Launched At */
+            launched_at: string;
+            /** Browser Port */
+            browser_port?: number | null;
         };
         /**
          * PollerEnqueueRequest
@@ -339,6 +674,57 @@ export interface components {
             deny_list_categories?: string[];
         };
         /**
+         * PullRequestResponse
+         * @description Public view of a ``pull_requests`` row for a bug.
+         *
+         *     Populated by Agent 8's merge driver; rendered on BugDetail so Megha
+         *     sees the PR URL immediately after clicking Confirm (and tracks it to
+         *     ``merged`` status once :func:`orchestrator.merge.merge_bug` finishes).
+         */
+        PullRequestResponse: {
+            /** Id */
+            id: number;
+            /** Repo Name */
+            repo_name: string;
+            /** Branch */
+            branch: string;
+            /** Pr Url */
+            pr_url: string | null;
+            /** Pr Number */
+            pr_number: number | null;
+            /** Status */
+            status: string;
+            /** Merged At */
+            merged_at: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+        };
+        /**
+         * RejectRequest
+         * @description Body for ``POST /bugs/{bug_id}/reject``.
+         */
+        RejectRequest: {
+            /** Reason */
+            reason: string;
+        };
+        /**
+         * RejectResponse
+         * @description Response for ``POST /bugs/{bug_id}/reject``.
+         */
+        RejectResponse: {
+            /** Status */
+            status: string;
+            /** Bug Id */
+            bug_id: number;
+            /** Rejection Count */
+            rejection_count: number;
+            /** New State */
+            new_state: string;
+        };
+        /**
          * RepoResponse
          * @description Public view of a single repo in a project.
          */
@@ -359,6 +745,38 @@ export interface components {
             github_origin: string;
             /** Main Branch */
             main_branch: string;
+        };
+        /**
+         * RetryResponse
+         * @description Response for ``POST /bugs/{bug_id}/retry``.
+         */
+        RetryResponse: {
+            /** Status */
+            status: string;
+            /** Bug Id */
+            bug_id: number;
+            /** Agent Role */
+            agent_role: string;
+            /** Attempt */
+            attempt: number;
+        };
+        /**
+         * StopResponse
+         * @description Body for POST /test-instances/stop.
+         */
+        StopResponse: {
+            /** Status */
+            status: string;
+        };
+        /**
+         * TakeOverResponse
+         * @description Response for ``POST /bugs/{bug_id}/take-over``.
+         */
+        TakeOverResponse: {
+            /** Status */
+            status: string;
+            /** Bug Id */
+            bug_id: number;
         };
         /**
          * TriageResponse
@@ -668,6 +1086,320 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+        };
+    };
+    get_bug_diff_bugs__bug_id__diff_get: {
+        parameters: {
+            query: {
+                /** @description Repo name from the project registry */
+                repo: string;
+            };
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiffResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_bug_diff_summary_bugs__bug_id__diff_summary_get: {
+        parameters: {
+            query: {
+                /** @description Repo name from the project registry */
+                repo: string;
+            };
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DiffSummaryResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    confirm_bug_endpoint_bugs__bug_id__confirm_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConfirmResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reject_bug_endpoint_bugs__bug_id__reject_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RejectRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RejectResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_bug_endpoint_bugs__bug_id__cancel_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CancelResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retry_bug_endpoint_bugs__bug_id__retry_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetryResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    take_over_bug_endpoint_bugs__bug_id__take_over_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TakeOverResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    launch_test_instance_test_instances_launch_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LaunchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LaunchResponse"];
+                };
+            };
+            /** @description Launch failed — readiness timeout, snapshot failure, or a partial-spawn that was cleaned up. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    stop_test_instance_test_instances_stop_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StopResponse"];
+                };
+            };
+        };
+    };
+    get_current_test_instance_test_instances_current_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Running instance snapshot. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description No instance currently running. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

@@ -253,6 +253,21 @@ def record_rejection(session: Session, *, bug_id: int, reason: str) -> Rejection
     return rejection
 
 
+def list_rejections(session: Session, bug_id: int) -> list[Rejection]:
+    """Return every ``rejections`` row for ``bug_id`` ordered oldest-first.
+
+    The Agent 8 reject endpoint uses this to render the rolling list of
+    reasons in the ``## Rejection Limit Reached`` section when a bug hits
+    3 rejections and gets pinned into BLOCKED.
+    """
+    stmt = (
+        select(Rejection)
+        .where(Rejection.bug_id == bug_id)
+        .order_by(Rejection.created_at.asc(), Rejection.id.asc())
+    )
+    return list(session.execute(stmt).scalars())
+
+
 # --- PullRequest -------------------------------------------------------------
 
 
@@ -276,6 +291,58 @@ def record_pr(
         status=status,
     )
     session.add(pr)
+    session.flush()
+    return pr
+
+
+def list_pull_requests(session: Session, bug_id: int) -> list[PullRequest]:
+    """Return every ``pull_requests`` row for ``bug_id``, oldest first."""
+    stmt = (
+        select(PullRequest)
+        .where(PullRequest.bug_id == bug_id)
+        .order_by(PullRequest.created_at.asc(), PullRequest.id.asc())
+    )
+    return list(session.execute(stmt).scalars())
+
+
+def find_open_pr(
+    session: Session, *, bug_id: int, repo_name: str
+) -> PullRequest | None:
+    """Return the most recent open PR for ``(bug_id, repo_name)`` or None.
+
+    Used by the merge driver (Agent 8) to reuse an already-created PR when
+    the user clicks Confirm a second time after a transient merge failure.
+    """
+    stmt = (
+        select(PullRequest)
+        .where(PullRequest.bug_id == bug_id)
+        .where(PullRequest.repo_name == repo_name)
+        .where(PullRequest.status == "open")
+        .order_by(PullRequest.created_at.desc(), PullRequest.id.desc())
+        .limit(1)
+    )
+    return session.execute(stmt).scalar_one_or_none()
+
+
+def update_pr_status(
+    session: Session,
+    *,
+    pr_id: int,
+    status: str,
+    merged_at: datetime | None = None,
+) -> PullRequest:
+    """Update a ``pull_requests`` row's ``status`` (and optional ``merged_at``).
+
+    Raises ``ValueError`` if ``pr_id`` isn't found — the caller is holding
+    the same ORM session that produced the row so a miss is a bug, not a
+    race condition.
+    """
+    pr = session.get(PullRequest, pr_id)
+    if pr is None:
+        raise ValueError(f"pull_requests row {pr_id} not found")
+    pr.status = status
+    if status == "merged" and pr.merged_at is None:
+        pr.merged_at = merged_at or _utcnow()
     session.flush()
     return pr
 

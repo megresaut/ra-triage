@@ -20,19 +20,29 @@ import subprocess
 from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from ra_triage.config.registry import RepoConfig, get_project
+from ra_triage.config.registry import ProjectConfig, RepoConfig, get_project
 from ra_triage.db import engine as engine_module
 from ra_triage.db import repo
 from ra_triage.db.models import AgentRun, Bug
 from ra_triage.integrations.notion import NotionClient, normalize_page
-from ra_triage.orchestrator.pipeline import run_pipeline
-from ra_triage.orchestrator.states import BugState
+from ra_triage.orchestrator.merge import merge_bug
+from ra_triage.orchestrator.pipeline import (
+    reinvestigate_with_feedback,
+    retry_last_agent,
+    run_pipeline,
+)
+from ra_triage.orchestrator.states import (
+    TERMINAL_STATES,
+    BugState,
+    IllegalBugStateTransition,
+)
 from ra_triage.settings import get_settings
 from ra_triage.triage_md import parser as triage_parser
 from ra_triage.workspaces import worktree as wt_module
@@ -59,12 +69,33 @@ def get_session() -> Iterator[Session]:
         session.close()
 
 
+class PullRequestResponse(BaseModel):
+    """Public view of a ``pull_requests`` row for a bug.
+
+    Populated by Agent 8's merge driver; rendered on BugDetail so Megha
+    sees the PR URL immediately after clicking Confirm (and tracks it to
+    ``merged`` status once :func:`orchestrator.merge.merge_bug` finishes).
+    """
+
+    id: int
+    repo_name: str
+    branch: str
+    pr_url: str | None
+    pr_number: int | None
+    status: str
+    merged_at: datetime | None
+    created_at: datetime
+
+
 class BugResponse(BaseModel):
     """Public view of a bug.
 
     `current_agent` and `conflict_files` are always null in Agent 2's surface
     — Agent 5 wires `current_agent` when it tracks the in-flight subprocess,
     and Agent 11 wires `conflict_files` when rebase conflicts are recorded.
+
+    ``pull_requests`` is populated by Agent 8's merge flow (empty list
+    until the Confirm button is clicked).
     """
 
     id: int
@@ -86,6 +117,7 @@ class BugResponse(BaseModel):
     current_agent: str | None = None
     conflict_files: list[str] | None = None
     launched_for_testing: bool = False
+    pull_requests: list[PullRequestResponse] = Field(default_factory=list)
 
 
 class AgentRunResponse(BaseModel):
@@ -114,6 +146,22 @@ class PollerEnqueueRequest(BaseModel):
 
 
 def _bug_to_response(bug: Bug, *, launched_bug_id: int | None) -> BugResponse:
+    # bug.pull_requests is eager-loaded via the ORM relationship.
+    prs = [
+        PullRequestResponse(
+            id=pr.id,
+            repo_name=pr.repo_name,
+            branch=pr.branch,
+            pr_url=pr.pr_url,
+            pr_number=pr.pr_number,
+            status=pr.status,
+            merged_at=pr.merged_at,
+            created_at=pr.created_at,
+        )
+        for pr in sorted(
+            bug.pull_requests, key=lambda p: (p.created_at, p.id)
+        )
+    ]
     return BugResponse(
         id=bug.id,
         notion_page_id=bug.notion_page_id,
@@ -134,6 +182,7 @@ def _bug_to_response(bug: Bug, *, launched_bug_id: int | None) -> BugResponse:
         current_agent=None,  # v2: Agent 5 populates
         conflict_files=None,  # v2: Agent 11 populates
         launched_for_testing=(launched_bug_id is not None and launched_bug_id == bug.id),
+        pull_requests=prs,
     )
 
 
@@ -282,13 +331,18 @@ def poller_enqueue(
 
 
 def _schedule_pipeline(bug_id: int) -> None:
-    """Best-effort ``asyncio.create_task(run_pipeline(bug_id))``.
+    """Best-effort ``asyncio.create_task(run_pipeline(bug_id))``."""
+    _schedule_coro(run_pipeline(bug_id), name=f"run_pipeline:{bug_id}")
 
-    The endpoint runs on FastAPI's threadpool (sync def), so the running
-    asyncio loop is the FastAPI app loop. We find it via
-    ``asyncio.get_event_loop_policy().get_event_loop()`` when we're not on
-    the loop thread, and fall back to the bus's attached loop — the same
-    pattern ``EventBus.publish_sync`` uses.
+
+def _schedule_coro(coro: Any, *, name: str) -> None:
+    """Best-effort ``asyncio.create_task(coro)`` on the app event loop.
+
+    Endpoints run on FastAPI's threadpool (sync def), so the event loop
+    we want is the one attached to the event bus by the lifespan hook.
+    If we're already on the loop thread (async endpoint), we use that
+    directly. On failure we log and drop — the caller will surface a
+    stale state via polling eventually.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -296,29 +350,29 @@ def _schedule_pipeline(bug_id: int) -> None:
         loop = None
 
     if loop is None:
-        # No loop on this thread — use the one the lifespan attached to
-        # the event bus. That's the FastAPI app loop.
         from ra_triage.utils.events import bus
 
         attached = bus.get_loop()
         if attached is None:
             logger.warning(
-                "Cannot schedule run_pipeline for bug %d: no running loop",
-                bug_id,
+                "Cannot schedule %s: no running loop (coro=%r)", name, coro
             )
+            # Close the coroutine so we don't leak a "never awaited" warning.
+            if hasattr(coro, "close"):
+                coro.close()
             return
         target_loop = attached
         try:
             target_loop.call_soon_threadsafe(
-                lambda: target_loop.create_task(run_pipeline(bug_id))
+                lambda: target_loop.create_task(coro, name=name)
             )
         except RuntimeError:
-            logger.exception(
-                "Failed to schedule run_pipeline for bug %d", bug_id
-            )
+            logger.exception("Failed to schedule %s", name)
+            if hasattr(coro, "close"):
+                coro.close()
         return
 
-    loop.create_task(run_pipeline(bug_id))
+    loop.create_task(coro, name=name)
 
 
 # --- TRIAGE.md & prompt endpoints (Agent 5) --------------------------
@@ -607,3 +661,389 @@ def _parse_shortstat(text: str) -> tuple[int, int, int]:
 # ``repo`` query parameter on the diff endpoints above. ``repo.get_bug``
 # wouldn't work there because ``repo`` is the local query string.
 _repo_module_get_bug = repo.get_bug
+
+
+# --- Agent 8: Confirm / Reject / Cancel / Retry / Take Over --------------
+
+#: Rejection count at which the bug pins to BLOCKED instead of looping back
+#: to INVESTIGATING. Matches orchestrator instructions (Flow 3) and product
+#: plan.
+REJECTION_LIMIT: int = 3
+
+
+class RejectRequest(BaseModel):
+    """Body for ``POST /bugs/{bug_id}/reject``."""
+
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class ConfirmResponse(BaseModel):
+    """Response for ``POST /bugs/{bug_id}/confirm``."""
+
+    status: str
+    bug_id: int
+
+
+class RejectResponse(BaseModel):
+    """Response for ``POST /bugs/{bug_id}/reject``."""
+
+    status: str
+    bug_id: int
+    rejection_count: int
+    new_state: str
+
+
+class CancelResponse(BaseModel):
+    """Response for ``POST /bugs/{bug_id}/cancel``."""
+
+    status: str
+    bug_id: int
+
+
+class RetryResponse(BaseModel):
+    """Response for ``POST /bugs/{bug_id}/retry``."""
+
+    status: str
+    bug_id: int
+    agent_role: str
+    attempt: int
+
+
+class TakeOverResponse(BaseModel):
+    """Response for ``POST /bugs/{bug_id}/take-over``."""
+
+    status: str
+    bug_id: int
+
+
+@router.post(
+    "/bugs/{bug_id}/confirm",
+    response_model=ConfirmResponse,
+    status_code=202,
+    tags=["review"],
+)
+def confirm_bug_endpoint(
+    bug_id: int,
+    session: Session = Depends(get_session),
+) -> ConfirmResponse:
+    """Confirm the bug's fix — kicks off the merge pipeline.
+
+    Validates the bug is in ``READY_FOR_REVIEW`` (409 otherwise). Returns
+    202 immediately; the merge itself runs as a background task via
+    :func:`orchestrator.merge.merge_bug`. The frontend subscribes to the
+    bug's state channel to observe MERGING → FIXED or MERGING → BLOCKED.
+    """
+    bug = repo.get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+    if bug.state != BugState.READY_FOR_REVIEW.value:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Bug {bug_id} is in state {bug.state!r}; confirm requires "
+                f"READY_FOR_REVIEW"
+            ),
+        )
+    _schedule_coro(merge_bug(bug_id), name=f"merge_bug:{bug_id}")
+    return ConfirmResponse(status="merging_started", bug_id=bug_id)
+
+
+@router.post(
+    "/bugs/{bug_id}/reject",
+    response_model=RejectResponse,
+    status_code=202,
+    tags=["review"],
+)
+def reject_bug_endpoint(
+    bug_id: int,
+    body: RejectRequest,
+    session: Session = Depends(get_session),
+) -> RejectResponse:
+    """Reject the current READY_FOR_REVIEW fix.
+
+    Records the rejection row (bumps ``rejection_count``) and either:
+      - bumps to the rejection limit → transition to BLOCKED and append a
+        ``## Rejection Limit Reached`` section to TRIAGE.md listing every
+        reason collected for this bug.
+      - otherwise → transition back to INVESTIGATING and schedule
+        :func:`orchestrator.pipeline.reinvestigate_with_feedback` with
+        this rejection's reason so the Investigator sees it in the
+        rendered prompt.
+
+    409 if the bug isn't in READY_FOR_REVIEW.
+    """
+    bug = repo.get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+    if bug.state != BugState.READY_FOR_REVIEW.value:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Bug {bug_id} is in state {bug.state!r}; reject requires "
+                f"READY_FOR_REVIEW"
+            ),
+        )
+
+    # Record the rejection first so `rejection_count` reflects THIS click.
+    repo.record_rejection(session, bug_id=bug_id, reason=body.reason)
+    session.flush()
+    new_count = bug.rejection_count
+
+    if new_count >= REJECTION_LIMIT:
+        # Pin to BLOCKED with a rolling list of all reasons.
+        try:
+            repo.update_bug_state(session, bug, BugState.BLOCKED)
+        except IllegalBugStateTransition as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        session.commit()
+        _append_rejection_limit_section(session, bug=bug)
+        return RejectResponse(
+            status="blocked",
+            bug_id=bug_id,
+            rejection_count=new_count,
+            new_state=BugState.BLOCKED.value,
+        )
+
+    # Under the limit — transition back to INVESTIGATING and re-run
+    # the Investigator with the reason threaded through.
+    try:
+        repo.update_bug_state(session, bug, BugState.INVESTIGATING)
+    except IllegalBugStateTransition as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session.commit()
+    _schedule_coro(
+        reinvestigate_with_feedback(bug_id, body.reason),
+        name=f"reinvestigate:{bug_id}",
+    )
+    return RejectResponse(
+        status="reinvestigating",
+        bug_id=bug_id,
+        rejection_count=new_count,
+        new_state=BugState.INVESTIGATING.value,
+    )
+
+
+def _append_rejection_limit_section(session: Session, *, bug: Bug) -> None:
+    """Write a ``## Rejection Limit Reached`` block to TRIAGE.md.
+
+    Lists every reject reason in the order they were recorded so the human
+    reviewer can see what's been tried.
+    """
+    project: ProjectConfig | None
+    try:
+        project = get_project(bug.project_id)
+    except KeyError:
+        project = None
+    triage_md_path = _merge_triage_md_path(bug.id, project)
+    rejections = repo.list_rejections(session, bug.id)
+    lines = [
+        "The reviewer has rejected this fix 3 times. The bug is now pinned "
+        "to BLOCKED — re-investigation alone has not converged on an "
+        "acceptable fix. Review the reasons below and either take over "
+        "manually, pick an alternative approach, or cancel.",
+        "",
+        "**Rejection reasons (oldest first):**",
+    ]
+    for idx, rej in enumerate(rejections, start=1):
+        reason = (rej.reason or "").strip() or "(empty)"
+        lines.append(f"{idx}. {reason}")
+    try:
+        triage_parser.append(
+            triage_md_path, "Rejection Limit Reached", "\n".join(lines)
+        )
+    except OSError:
+        logger.exception(
+            "Could not append Rejection Limit Reached section to %s",
+            triage_md_path,
+        )
+
+
+def _merge_triage_md_path(bug_id: int, project: ProjectConfig | None) -> Path:
+    """Pick the TRIAGE.md path for post-review writes (Agent 8 helpers).
+
+    Mirrors the merge driver's resolution: backend repo first, fall back
+    to the first worktree, ultimately a synthetic path under the bug's
+    .escalation dir.
+    """
+    worktrees = wt_module.list_worktrees(bug_id)
+    if project is not None:
+        for r in project.repos:
+            if r.role == "backend" and r.name in worktrees:
+                return worktrees[r.name] / "TRIAGE.md"
+        for r in project.repos:
+            if r.name in worktrees:
+                return worktrees[r.name] / "TRIAGE.md"
+    if worktrees:
+        return next(iter(worktrees.values())) / "TRIAGE.md"
+    settings = get_settings()
+    return (
+        settings.worktrees_dir / str(bug_id) / ".escalation" / "TRIAGE.md"
+    )
+
+
+@router.post(
+    "/bugs/{bug_id}/cancel",
+    response_model=CancelResponse,
+    tags=["review"],
+)
+def cancel_bug_endpoint(
+    bug_id: int,
+    session: Session = Depends(get_session),
+) -> CancelResponse:
+    """Cancel the bug. Allowed from any non-terminal state.
+
+    Transitions to CANCELLED (which also fires Notion status write-back
+    to "Won't Fix" via the hook) and cleans up the bug's worktrees. The
+    cleanup is best-effort — we swallow errors so the state transition
+    always commits.
+    """
+    bug = repo.get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+    current = BugState(bug.state)
+    if current in TERMINAL_STATES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Bug {bug_id} is already terminal ({current.value})",
+        )
+    try:
+        repo.update_bug_state(session, bug, BugState.CANCELLED)
+    except IllegalBugStateTransition as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session.commit()
+
+    # Worktree cleanup fires on the event loop so the sync endpoint can
+    # return immediately. The cleanup helper is idempotent and logs on
+    # failure.
+    try:
+        project = get_project(bug.project_id)
+    except KeyError:
+        project = None
+    if project is not None:
+        _schedule_coro(
+            wt_module.cleanup(bug_id, list(project.repos)),
+            name=f"cleanup:{bug_id}",
+        )
+    return CancelResponse(status="cancelled", bug_id=bug_id)
+
+
+@router.post(
+    "/bugs/{bug_id}/retry",
+    response_model=RetryResponse,
+    status_code=202,
+    tags=["review"],
+)
+def retry_bug_endpoint(
+    bug_id: int,
+    session: Session = Depends(get_session),
+) -> RetryResponse:
+    """Re-run the most recent agent role with ``attempt += 1``.
+
+    409 if the bug is terminal or if no prior agent run exists, or if the
+    latest run doesn't satisfy retry-eligibility (see
+    :func:`orchestrator.pipeline.retry_last_agent`).
+    """
+    bug = repo.get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+
+    current = BugState(bug.state)
+    if current in TERMINAL_STATES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Bug {bug_id} is terminal ({current.value}); retry not allowed",
+        )
+
+    runs = repo.list_agent_runs(session, bug_id)
+    if not runs:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Bug {bug_id} has no agent runs to retry",
+        )
+    latest = runs[-1]
+    # BLOCKED-path retries require the latest run to be a *_FAILED.
+    if current == BugState.BLOCKED:
+        tok = latest.completion_token or ""
+        if not tok.endswith("_FAILED"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Bug {bug_id} is BLOCKED but latest agent run isn't a "
+                    f"*_FAILED (role={latest.agent_role!r}, token={tok!r}); "
+                    "retry is only supported for explicit failures"
+                ),
+            )
+
+    new_attempt = latest.attempt + 1
+    role = latest.agent_role
+    _schedule_coro(retry_last_agent(bug_id), name=f"retry:{bug_id}")
+    return RetryResponse(
+        status="retrying",
+        bug_id=bug_id,
+        agent_role=role,
+        attempt=new_attempt,
+    )
+
+
+@router.post(
+    "/bugs/{bug_id}/take-over",
+    response_model=TakeOverResponse,
+    tags=["review"],
+)
+def take_over_bug_endpoint(
+    bug_id: int,
+    session: Session = Depends(get_session),
+) -> TakeOverResponse:
+    """Mark the bug as taken-over manually.
+
+    Transitions to BLOCKED (so the Notion status flips to "Blocked" via
+    the hook) and appends a ``## Taken Over Manually`` marker section to
+    TRIAGE.md. Does NOT clean up the worktree — Megha uses it out of
+    band.
+
+    Allowed from any non-terminal state.
+    """
+    bug = repo.get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+    current = BugState(bug.state)
+    if current in TERMINAL_STATES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Bug {bug_id} is already terminal ({current.value})",
+        )
+    if current == BugState.BLOCKED:
+        # Idempotent — still append the marker so the reason is visible.
+        _append_take_over_marker(bug)
+        return TakeOverResponse(status="blocked", bug_id=bug_id)
+    try:
+        repo.update_bug_state(session, bug, BugState.BLOCKED)
+    except IllegalBugStateTransition as exc:
+        # Some states (e.g. MERGING) only allow BLOCKED as an outgoing
+        # edge; if we somehow can't reach BLOCKED, surface the reason.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    session.commit()
+    _append_take_over_marker(bug)
+    return TakeOverResponse(status="blocked", bug_id=bug_id)
+
+
+def _append_take_over_marker(bug: Bug) -> None:
+    """Append a ``## Taken Over Manually`` section to TRIAGE.md."""
+    try:
+        project = get_project(bug.project_id)
+    except KeyError:
+        project = None
+    triage_md_path = _merge_triage_md_path(bug.id, project)
+    body = (
+        "The reviewer has chosen to take this bug over manually. The "
+        "bug is now BLOCKED; the worktree is retained (not cleaned up) so "
+        "it can be used out-of-band. When the work is done, close the PR "
+        "manually or mark the bug as Cancelled / Fixed via the usual "
+        "channels."
+    )
+    try:
+        triage_parser.append(triage_md_path, "Taken Over Manually", body)
+    except OSError:
+        logger.exception(
+            "Could not append Taken Over Manually section to %s", triage_md_path
+        )

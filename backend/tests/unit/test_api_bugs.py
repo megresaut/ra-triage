@@ -7,6 +7,9 @@ the monkeypatch on `engine_module`.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
+import pytest
 from fastapi.testclient import TestClient
 
 from ra_triage.main import create_app
@@ -99,6 +102,109 @@ def test_agent_runs_endpoint_empty_then_404(alembic_db: object) -> None:
 
     missing = client.get("/bugs/42424242/agent-runs")
     assert missing.status_code == 404
+
+
+def test_poller_enqueue_fetches_real_page_when_token_set(
+    alembic_db: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When NOTION_TOKEN is set and the caller omits title/description,
+    the endpoint attempts a real Notion fetch and uses the returned fields."""
+    _ = alembic_db
+    monkeypatch.setenv("NOTION_TOKEN", "secret_test")
+    from ra_triage import settings as settings_module
+
+    settings_module.get_settings.cache_clear()
+
+    fake_page = {
+        "id": "real-page-1",
+        "properties": {
+            "Name": {
+                "type": "title",
+                "title": [{"type": "text", "plain_text": "Real Notion Title"}],
+            },
+            "Description": {
+                "type": "rich_text",
+                "rich_text": [
+                    {"type": "text", "plain_text": "Real Notion description"}
+                ],
+            },
+            "Severity": {"type": "select", "select": {"name": "High"}},
+            "Status": {"type": "status", "status": {"name": "Open"}},
+        },
+    }
+
+    fake_sdk = MagicMock()
+    fake_sdk.pages.retrieve.return_value = fake_page
+
+    from ra_triage.integrations import notion as notion_mod
+
+    monkeypatch.setattr(notion_mod, "Client", MagicMock(return_value=fake_sdk))
+
+    client = TestClient(create_app())
+    response = client.post("/poller/enqueue", json={"notion_page_id": "real-page-1"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["title"] == "Real Notion Title"
+    assert body["description"] == "Real Notion description"
+    assert body["severity"] == "High"
+
+
+def test_poller_enqueue_falls_back_when_notion_fetch_fails(
+    alembic_db: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the Notion fetch raises, we fall back to the placeholder values."""
+    _ = alembic_db
+    monkeypatch.setenv("NOTION_TOKEN", "secret_test")
+    from ra_triage import settings as settings_module
+
+    settings_module.get_settings.cache_clear()
+
+    fake_sdk = MagicMock()
+    fake_sdk.pages.retrieve.side_effect = RuntimeError("network down")
+
+    from ra_triage.integrations import notion as notion_mod
+
+    monkeypatch.setattr(notion_mod, "Client", MagicMock(return_value=fake_sdk))
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/poller/enqueue", json={"notion_page_id": "never-fetched"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["title"] == "Bug never-fetched"
+    assert body["description"] == "(manually enqueued, no Notion fetch)"
+
+
+def test_poller_enqueue_skips_fetch_when_caller_supplies_fields(
+    alembic_db: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit title/description bypasses the Notion fetch entirely."""
+    _ = alembic_db
+    monkeypatch.setenv("NOTION_TOKEN", "secret_test")
+    from ra_triage import settings as settings_module
+
+    settings_module.get_settings.cache_clear()
+
+    fake_sdk = MagicMock()
+
+    from ra_triage.integrations import notion as notion_mod
+
+    monkeypatch.setattr(notion_mod, "Client", MagicMock(return_value=fake_sdk))
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/poller/enqueue",
+        json={
+            "notion_page_id": "manual-1",
+            "title": "Manual title",
+            "description": "Manual desc",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["title"] == "Manual title"
+    # The Notion SDK was never called.
+    fake_sdk.pages.retrieve.assert_not_called()
 
 
 def test_ws_bugs_receives_hello_and_state_change(alembic_db: object) -> None:

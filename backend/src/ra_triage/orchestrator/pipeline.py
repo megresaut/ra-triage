@@ -1,0 +1,690 @@
+"""Per-bug pipeline driver.
+
+``run_pipeline(bug_id)`` advances a bug through the state machine,
+spawning agents as needed. Agent 5 implements only the slice from OPEN
+→ TRIAGED → INVESTIGATING → (BLOCKED | READY_FOR_REVIEW stub). Later
+agents (6, 10) fill in FIXING/TESTING and DESIGNING/FIXING_PARALLEL.
+
+Key invariants:
+  - Every state transition goes through ``db.repo.update_bug_state``
+    (validates via the state machine, fires the Notion write-back hook).
+    Never write ``bug.state = ...`` directly from here.
+  - Every agent invocation is bracketed by an ``agent_runs`` row:
+    insert with ``started_at=now()``, then update with the completion
+    details once ``agent.run`` returns.
+  - Before each transition, re-load the bug so we observe any concurrent
+    cancellation. If the bug is now terminal or CANCELLED, return early.
+  - Concurrency is bounded by :data:`orchestrator.concurrency.PIPELINE_SEMAPHORE`.
+
+Worktree strategy for TRIAGE.md: cross-repo bugs still converge on ONE
+TRIAGE.md. We pick the backend repo's worktree as the canonical home;
+single-repo bugs naturally use that one. If no repo has ``role=="backend"``
+we fall back to the first configured repo.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from ra_triage.agents.base import AgentResult
+from ra_triage.agents.investigator import Investigator
+from ra_triage.config.registry import ProjectConfig, RepoConfig, get_project
+from ra_triage.db import engine as engine_module
+from ra_triage.db import repo as repo_module
+from ra_triage.db.models import AgentRun, Bug
+from ra_triage.orchestrator import concurrency
+from ra_triage.orchestrator.states import (
+    TERMINAL_STATES,
+    BugState,
+    IllegalBugStateTransition,
+)
+from ra_triage.triage_md import parser as triage_parser
+from ra_triage.workspaces import worktree as wt_module
+
+logger = logging.getLogger(__name__)
+
+
+# --- Public entry point --------------------------------------------------
+
+
+async def run_pipeline(bug_id: int) -> None:
+    """Drive a single bug through the pipeline.
+
+    Never raises: all failures are logged and translated into a BLOCKED
+    transition (when the current state permits) so bugs don't get stuck
+    in phantom states. The caller schedules this via
+    ``asyncio.create_task(run_pipeline(bug_id))``.
+    """
+    async with concurrency.PIPELINE_SEMAPHORE:
+        try:
+            await _run_pipeline_body(bug_id)
+        except Exception:
+            logger.exception(
+                "run_pipeline crashed for bug_id=%s — check agent_runs for state",
+                bug_id,
+            )
+
+
+async def _run_pipeline_body(bug_id: int) -> None:
+    """Pipeline body — runs with the semaphore held."""
+    bug_snapshot = await _load_bug(bug_id)
+    if bug_snapshot is None:
+        logger.warning("run_pipeline: bug_id=%s not found; aborting", bug_id)
+        return
+    if _is_terminal(bug_snapshot["state"]):
+        logger.info(
+            "run_pipeline: bug_id=%s already terminal (%s); aborting",
+            bug_id,
+            bug_snapshot["state"],
+        )
+        return
+
+    project = get_project(bug_snapshot["project_id"])
+
+    # Step: OPEN → TRIAGED
+    if bug_snapshot["state"] == BugState.OPEN.value:
+        await _transition(bug_id, BugState.TRIAGED)
+        bug_snapshot = await _load_bug(bug_id)
+        if bug_snapshot is None or _is_terminal(bug_snapshot["state"]):
+            return
+
+    # Step: TRIAGED → INVESTIGATING (with worktree creation + Investigator)
+    if bug_snapshot["state"] == BugState.TRIAGED.value:
+        try:
+            worktrees = await wt_module.create_worktrees_for_bug(
+                bug_id, project.repos
+            )
+        except wt_module.DirtyCanonicalCloneError as exc:
+            await _block_with_escalation(
+                bug_id,
+                project=project,
+                reason_title="Dirty canonical clone",
+                reason_body=str(exc),
+            )
+            return
+        except wt_module.WorktreeError as exc:
+            logger.exception("Worktree setup failed for bug %d", bug_id)
+            await _block_with_escalation(
+                bug_id,
+                project=project,
+                reason_title="Worktree setup failed",
+                reason_body=str(exc),
+            )
+            return
+
+        triage_md_path = _triage_md_worktree(project, worktrees) / "TRIAGE.md"
+        # Create an empty TRIAGE.md so the Investigator has something to
+        # append to if the agent prefers append-only writes.
+        triage_md_path.parent.mkdir(parents=True, exist_ok=True)
+        if not triage_md_path.exists():
+            triage_md_path.write_text("", encoding="utf-8")
+
+        await _transition(bug_id, BugState.INVESTIGATING)
+        bug_snapshot = await _load_bug(bug_id)
+        if bug_snapshot is None or _is_terminal(bug_snapshot["state"]):
+            return
+
+        result = await _run_investigator(
+            bug_id=bug_id,
+            project=project,
+            worktrees=worktrees,
+            triage_md_path=triage_md_path,
+        )
+
+        await _route_after_investigator(
+            bug_id=bug_id,
+            project=project,
+            result=result,
+            triage_md_path=triage_md_path,
+        )
+        return
+
+    if bug_snapshot["state"] == BugState.INVESTIGATING.value:
+        # Resume logic is Agent 12's scope. If we see a bug already in
+        # INVESTIGATING here, that means a prior run left it hanging.
+        # For THIS PR we log and exit; Agent 12 will re-spawn.
+        logger.info(
+            "run_pipeline: bug_id=%s already INVESTIGATING; leaving for Agent 12 resume",
+            bug_id,
+        )
+        return
+
+    # Any other state means a later-agent responsibility (FIXING, TESTING,
+    # DESIGNING, FIXING_PARALLEL, INTEGRATION_TESTING, READY_FOR_REVIEW,
+    # BLOCKED, MERGING). Surface a clear error marker.
+    raise NotImplementedError(
+        f"pipeline step {bug_snapshot['state']} belongs to a later agent "
+        f"(bug_id={bug_id})"
+    )
+
+
+# --- Investigator run + routing -----------------------------------------
+
+
+async def _run_investigator(
+    *,
+    bug_id: int,
+    project: ProjectConfig,
+    worktrees: dict[str, Path],
+    triage_md_path: Path,
+) -> AgentResult:
+    """Spawn the Investigator, record its agent_runs row, return the result."""
+    home_worktree = _triage_md_worktree(project, worktrees)
+    attempt = await _next_attempt(bug_id, role="investigator")
+    started_at = _utcnow()
+
+    # Pre-insert the agent_runs row so operators can observe an in-flight
+    # run. The post-run update below back-fills the completion fields.
+    run_id = await _insert_agent_run_start(
+        bug_id=bug_id,
+        role="investigator",
+        attempt=attempt,
+        started_at=started_at,
+        # Base class also writes these; we compute the paths in advance
+        # so the DB row is populated from the outset.
+        log_path=_predicted_log_path(bug_id, "investigator", attempt),
+        prompt_path=_predicted_prompt_path(bug_id, "investigator", attempt),
+    )
+
+    bug = await _load_bug_row(bug_id)
+    if bug is None:
+        raise RuntimeError(f"Bug {bug_id} vanished mid-pipeline")
+
+    repos_context = [
+        {
+            "name": r.name,
+            "role": r.role,
+            "worktree_path": str(worktrees.get(r.name, "")),
+        }
+        for r in project.repos
+    ]
+
+    context: dict[str, Any] = {
+        "bug": {
+            "id": bug["id"],
+            "title": bug["title"],
+            "description": bug["description"],
+            "repro_steps": bug["repro_steps"] or "(none)",
+            "severity": bug["severity"] or "(unspecified)",
+            "reporter": bug["reporter"] or "(unspecified)",
+        },
+        "project": {"display_name": project.display_name},
+        "repos": repos_context,
+        "deny_list": {
+            "paths": list(project.deny_list.paths),
+            "categories": list(project.deny_list.categories),
+        },
+        "rejection_feedback": None,
+        "triage_md_path": str(triage_md_path),
+        "attempt": attempt,
+    }
+
+    investigator = Investigator()
+
+    # The base class returns an AgentResult wrapping the subprocess outcome.
+    # We deliberately run the subprocess from the TRIAGE.md home worktree —
+    # for single-repo it matches that repo; for cross-repo the Investigator
+    # can still Read files in other worktrees via absolute paths from the
+    # context (``repos[*].worktree_path``).
+    result = await investigator.run(
+        bug=_BugView(**bug),
+        worktree=home_worktree,
+        context=context,
+    )
+
+    await _finalize_agent_run(
+        run_id=run_id,
+        ended_at=result.ended_at,
+        exit_code=result.exit_code,
+        completion_token=result.completion_token,
+        log_path=result.log_path,
+        prompt_path=result.prompt_path,
+        triage_md_snapshot=result.triage_md,
+    )
+
+    return result
+
+
+async def _route_after_investigator(
+    *,
+    bug_id: int,
+    project: ProjectConfig,
+    result: AgentResult,
+    triage_md_path: Path,
+) -> None:
+    """Decide the next state based on TRIAGE.md + completion token."""
+    sections = triage_parser.parse(triage_md_path)
+    scope = triage_parser.get_scope(sections)
+
+    # Persist scope + affected_repos + deny_list_hit on the bug regardless
+    # of next transition. These columns drive the frontend queue view.
+    await _persist_scope(bug_id, scope)
+
+    completion_token = result.completion_token
+    escalated = triage_parser.has_escalation(sections)
+
+    if completion_token == "INVESTIGATOR_FAILED" or escalated:
+        logger.info(
+            "Investigator routed bug %d to BLOCKED (token=%s, escalation=%s)",
+            bug_id,
+            completion_token,
+            escalated,
+        )
+        await _transition(bug_id, BugState.BLOCKED)
+        return
+
+    if scope["scope"] == "single-repo":
+        logger.warning(
+            "Agent 5 stub: single-repo happy path not yet implemented — "
+            "marking bug %d READY_FOR_REVIEW directly (Agent 6 fills in FIXING/TESTING)",
+            bug_id,
+        )
+        await _stub_advance_through_fixing_testing(bug_id)
+        return
+
+    if scope["scope"] == "cross-repo":
+        logger.warning(
+            "Agent 5 stub: cross-repo happy path not yet implemented — "
+            "marking bug %d READY_FOR_REVIEW directly (Agent 10 fills in DESIGNING → "
+            "FIXING_PARALLEL → INTEGRATION_TESTING)",
+            bug_id,
+        )
+        await _stub_advance_through_cross_repo(bug_id)
+        return
+
+    # Malformed / missing scope — treat as BLOCKED with a brief.
+    logger.warning(
+        "Investigator produced malformed or missing Scope for bug %d; routing to BLOCKED",
+        bug_id,
+    )
+    triage_parser.append(
+        triage_md_path,
+        "Escalation Brief",
+        "- **TL;DR:** Investigator's Scope section was missing or malformed; "
+        "human review required.\n"
+        "- **Why blocked:** Orchestrator cannot decide single-repo vs cross-repo "
+        "without a parseable Scope block.\n"
+        "- **What I need from you:** Inspect TRIAGE.md and either re-run the "
+        "Investigator or take over manually.",
+    )
+    await _transition(bug_id, BugState.BLOCKED)
+
+
+async def _stub_advance_through_fixing_testing(bug_id: int) -> None:
+    """Stub for Agent 6: advance INVESTIGATING → FIXING → TESTING → READY_FOR_REVIEW.
+
+    Agents 5's acceptance criteria calls for the bug to land in
+    READY_FOR_REVIEW when scope is single-repo and there is no escalation.
+    The real happy path runs the Fixer + Tester; we short-circuit through
+    the intermediate states because the state machine doesn't allow a direct
+    INVESTIGATING → READY_FOR_REVIEW transition.
+    """
+    await _transition(bug_id, BugState.FIXING)
+    await _transition(bug_id, BugState.TESTING)
+    await _transition(bug_id, BugState.READY_FOR_REVIEW)
+
+
+async def _stub_advance_through_cross_repo(bug_id: int) -> None:
+    """Stub for Agent 10: advance INVESTIGATING → ... → READY_FOR_REVIEW (cross-repo)."""
+    await _transition(bug_id, BugState.DESIGNING)
+    await _transition(bug_id, BugState.FIXING_PARALLEL)
+    await _transition(bug_id, BugState.INTEGRATION_TESTING)
+    await _transition(bug_id, BugState.READY_FOR_REVIEW)
+
+
+# --- DB helpers (all sync work dispatched to threadpool) -----------------
+
+
+def _is_terminal(state_value: str) -> bool:
+    try:
+        return BugState(state_value) in TERMINAL_STATES
+    except ValueError:
+        return False
+
+
+async def _load_bug(bug_id: int) -> dict[str, Any] | None:
+    """Load a bug snapshot as a plain dict (JSON-serializable, loop-safe)."""
+    return await asyncio.to_thread(_load_bug_sync, bug_id)
+
+
+async def _load_bug_row(bug_id: int) -> dict[str, Any] | None:
+    """Alias for ``_load_bug`` — used where the caller wants to emphasize
+    a fresh re-load (e.g. right before an agent spawn)."""
+    return await _load_bug(bug_id)
+
+
+def _load_bug_sync(bug_id: int) -> dict[str, Any] | None:
+    session = engine_module.SessionLocal()
+    try:
+        bug = repo_module.get_bug(session, bug_id)
+        if bug is None:
+            return None
+        return _bug_to_dict(bug)
+    finally:
+        session.close()
+
+
+def _bug_to_dict(bug: Bug) -> dict[str, Any]:
+    return {
+        "id": bug.id,
+        "notion_page_id": bug.notion_page_id,
+        "project_id": bug.project_id,
+        "title": bug.title,
+        "description": bug.description,
+        "repro_steps": bug.repro_steps,
+        "severity": bug.severity,
+        "reporter": bug.reporter,
+        "state": bug.state,
+        "scope": bug.scope,
+        "affected_repos": bug.affected_repos,
+        "deny_list_hit": bug.deny_list_hit,
+        "rejection_count": bug.rejection_count,
+    }
+
+
+class _BugView:
+    """Lightweight duck-typed bug for ``ClaudeCodeAgent.run``.
+
+    The base class only reads ``bug.id``; everything else flows via the
+    context dict rendered into the prompt. We keep a tiny value object
+    here rather than reaching into the SQLAlchemy session across threads.
+    """
+
+    def __init__(self, **fields: Any) -> None:
+        for k, v in fields.items():
+            setattr(self, k, v)
+
+
+async def _transition(bug_id: int, new_state: BugState) -> None:
+    """Transition the bug, re-loading first to respect cancellation.
+
+    Never raises :class:`IllegalBugStateTransition` out: if the bug has
+    already been cancelled or is otherwise in a state that can't reach
+    ``new_state``, we log and return. This matches the "respect cancel"
+    requirement from Agent 5's brief.
+    """
+    await asyncio.to_thread(_transition_sync, bug_id, new_state)
+
+
+def _transition_sync(bug_id: int, new_state: BugState) -> None:
+    session = engine_module.SessionLocal()
+    try:
+        bug = repo_module.get_bug(session, bug_id)
+        if bug is None:
+            logger.warning("transition: bug_id=%s disappeared; skipping", bug_id)
+            return
+        if BugState(bug.state) in TERMINAL_STATES:
+            logger.info(
+                "transition: bug_id=%s already terminal (%s); skipping %s",
+                bug_id,
+                bug.state,
+                new_state.value,
+            )
+            return
+        try:
+            repo_module.update_bug_state(session, bug, new_state)
+            session.commit()
+        except IllegalBugStateTransition as exc:
+            session.rollback()
+            logger.warning(
+                "transition: illegal %s → %s for bug_id=%s: %s",
+                bug.state,
+                new_state.value,
+                bug_id,
+                exc,
+            )
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+async def _next_attempt(bug_id: int, *, role: str) -> int:
+    return await asyncio.to_thread(_next_attempt_sync, bug_id, role)
+
+
+def _next_attempt_sync(bug_id: int, role: str) -> int:
+    session = engine_module.SessionLocal()
+    try:
+        runs = repo_module.list_agent_runs(session, bug_id)
+        existing = [r.attempt for r in runs if r.agent_role == role]
+        return (max(existing) + 1) if existing else 1
+    finally:
+        session.close()
+
+
+async def _insert_agent_run_start(
+    *,
+    bug_id: int,
+    role: str,
+    attempt: int,
+    started_at: datetime,
+    log_path: Path,
+    prompt_path: Path,
+) -> int:
+    return await asyncio.to_thread(
+        _insert_agent_run_start_sync,
+        bug_id,
+        role,
+        attempt,
+        started_at,
+        str(log_path),
+        str(prompt_path),
+    )
+
+
+def _insert_agent_run_start_sync(
+    bug_id: int,
+    role: str,
+    attempt: int,
+    started_at: datetime,
+    log_path: str,
+    prompt_path: str,
+) -> int:
+    session = engine_module.SessionLocal()
+    try:
+        run = repo_module.record_agent_run(
+            session,
+            bug_id=bug_id,
+            agent_role=role,
+            attempt=attempt,
+            started_at=started_at,
+            log_path=log_path,
+            prompt_path=prompt_path,
+        )
+        session.commit()
+        return int(run.id)
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+async def _finalize_agent_run(
+    *,
+    run_id: int,
+    ended_at: datetime,
+    exit_code: int,
+    completion_token: str | None,
+    log_path: Path,
+    prompt_path: Path,
+    triage_md_snapshot: str,
+) -> None:
+    await asyncio.to_thread(
+        _finalize_agent_run_sync,
+        run_id,
+        ended_at,
+        exit_code,
+        completion_token,
+        str(log_path),
+        str(prompt_path),
+        triage_md_snapshot,
+    )
+
+
+def _finalize_agent_run_sync(
+    run_id: int,
+    ended_at: datetime,
+    exit_code: int,
+    completion_token: str | None,
+    log_path: str,
+    prompt_path: str,
+    triage_md_snapshot: str,
+) -> None:
+    session = engine_module.SessionLocal()
+    try:
+        run = session.get(AgentRun, run_id)
+        if run is None:
+            logger.warning("finalize_agent_run: run_id=%s not found", run_id)
+            return
+        run.ended_at = ended_at
+        run.exit_code = exit_code
+        run.completion_token = completion_token
+        run.log_path = log_path
+        run.prompt_path = prompt_path
+        run.triage_md_snapshot = triage_md_snapshot
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+async def _persist_scope(bug_id: int, scope: dict[str, Any]) -> None:
+    await asyncio.to_thread(_persist_scope_sync, bug_id, scope)
+
+
+def _persist_scope_sync(bug_id: int, scope: dict[str, Any]) -> None:
+    session = engine_module.SessionLocal()
+    try:
+        bug = repo_module.get_bug(session, bug_id)
+        if bug is None:
+            return
+        bug.scope = scope["scope"]  # may be None — acceptable
+        bug.affected_repos = json.dumps(scope["affected_repos"])
+        bug.deny_list_hit = bool(scope["deny_list_hit"])
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+async def _block_with_escalation(
+    bug_id: int,
+    *,
+    project: ProjectConfig,
+    reason_title: str,
+    reason_body: str,
+) -> None:
+    """Write an Escalation Brief to TRIAGE.md and transition to BLOCKED.
+
+    Used when the pipeline itself hits a pre-Investigator failure
+    (DirtyCanonicalClone, worktree setup). State order: current state →
+    (TRIAGED only if still OPEN) → INVESTIGATING → BLOCKED.
+    """
+    # TRIAGE.md for bug even if worktree creation failed: write under the
+    # worktrees dir even if the repo worktree itself is missing — Agent 12's
+    # resume path will still see it.
+    triage_md_path = _fallback_triage_md_path(bug_id, project)
+    triage_md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    triage_parser.append(
+        triage_md_path,
+        "Escalation Brief",
+        f"- **TL;DR:** {reason_title}.\n\n{reason_body}",
+    )
+
+    # Walk whatever state we're in into BLOCKED via legal transitions.
+    bug_snapshot = await _load_bug(bug_id)
+    if bug_snapshot is None:
+        return
+    current = BugState(bug_snapshot["state"])
+    if current == BugState.OPEN:
+        await _transition(bug_id, BugState.TRIAGED)
+        current = BugState.TRIAGED
+    if current == BugState.TRIAGED:
+        await _transition(bug_id, BugState.INVESTIGATING)
+        current = BugState.INVESTIGATING
+    if current == BugState.INVESTIGATING:
+        await _transition(bug_id, BugState.BLOCKED)
+
+
+# --- Path helpers --------------------------------------------------------
+
+
+def _triage_md_worktree(
+    project: ProjectConfig, worktrees: dict[str, Path]
+) -> Path:
+    """Pick the worktree that hosts TRIAGE.md for this bug.
+
+    Preference: first repo with ``role == "backend"``, fall back to first
+    configured repo. Cross-repo bugs converge here even though their work
+    spans multiple worktrees.
+    """
+    preferred: RepoConfig | None = None
+    for r in project.repos:
+        if r.role == "backend":
+            preferred = r
+            break
+    if preferred is None and project.repos:
+        preferred = project.repos[0]
+    if preferred is None:
+        raise RuntimeError(
+            f"Project {project.id} has no repos; cannot pick TRIAGE.md worktree"
+        )
+    path = worktrees.get(preferred.name)
+    if path is None:
+        # Caller didn't create a worktree for the preferred repo — try the
+        # first available one instead.
+        if worktrees:
+            return next(iter(worktrees.values()))
+        raise RuntimeError(
+            f"No worktrees available for bug; preferred={preferred.name}"
+        )
+    return path
+
+
+def _fallback_triage_md_path(bug_id: int, project: ProjectConfig) -> Path:
+    """Compute a TRIAGE.md path when worktrees could not be created.
+
+    We still need SOMEWHERE to persist the Escalation Brief explaining
+    why the pipeline stalled. We put it at
+    ``<worktrees_root>/<bug_id>/.escalation/TRIAGE.md`` — this dir is
+    never a git worktree, so the resume path can tell it apart.
+    """
+    from ra_triage.settings import get_settings
+
+    settings = get_settings()
+    return settings.worktrees_dir / str(bug_id) / ".escalation" / "TRIAGE.md"
+
+
+def _predicted_log_path(bug_id: int, role: str, attempt: int) -> Path:
+    from ra_triage.settings import get_settings
+
+    return get_settings().logs_dir / str(bug_id) / f"{role}.{attempt}.log"
+
+
+def _predicted_prompt_path(bug_id: int, role: str, attempt: int) -> Path:
+    from ra_triage.settings import get_settings
+
+    return get_settings().prompts_dir / str(bug_id) / f"{role}.{attempt}.md"
+
+
+# --- Misc ----------------------------------------------------------------
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+__all__ = ["run_pipeline"]

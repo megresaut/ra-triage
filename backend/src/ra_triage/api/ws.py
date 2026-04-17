@@ -2,7 +2,7 @@
 
 Channels:
   - /ws/bugs            — queue-wide state-change broadcast (Agent 2)
-  - /ws/bugs/{bug_id}/logs — per-bug agent stdout (placeholder; Agent 5)
+  - /ws/bugs/{bug_id}/logs — per-bug agent stdout (Agent 5)
   - /ws/test-instance   — test-instance log stream (placeholder; Agent 7)
 
 Every frame is JSON with a `type` discriminator per tech plan §7.2.
@@ -11,13 +11,24 @@ Every frame is JSON with a `type` discriminator per tech plan §7.2.
 from __future__ import annotations
 
 import asyncio
+import logging
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from ra_triage.utils.events import bus, topic_bugs_queue
+from ra_triage.db import engine as engine_module
+from ra_triage.db import repo as repo_module
+from ra_triage.utils.events import bus, topic_bug_logs, topic_bugs_queue
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["websockets"])
+
+
+#: Max number of historical log lines replayed on a fresh WS connection.
+#: Gives reconnecting clients immediate context without dumping gigabytes.
+LOG_BACKFILL_LINES: int = 200
 
 
 async def _forward_until_disconnect(
@@ -80,19 +91,85 @@ async def ws_bugs(websocket: WebSocket) -> None:
 async def ws_bug_logs(websocket: WebSocket, bug_id: int) -> None:
     """Per-bug live log stream.
 
-    Placeholder — accepts connection, emits a `hello` frame including the
-    bug_id, then idles. Agent 5 wires up real agent-stdout forwarding here.
+    Subscribes to the per-bug logs topic and forwards every
+    ``agent_stdout`` event to the client. On connect, also replays the
+    last ``LOG_BACKFILL_LINES`` lines from the most recent agent_run's
+    log file (if one exists) so reconnecting clients see context
+    immediately rather than blank space until the next event.
     """
     await websocket.accept()
     await websocket.send_json({"type": "hello", "bug_id": bug_id})
+
+    # Subscribe FIRST so we don't race-lose events between backfill and
+    # live streaming.
+    queue = await bus.subscribe(topic_bug_logs(bug_id))
+
     try:
-        while True:
-            # Drain any client frames so disconnects surface promptly.
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        return
+        await _send_log_backfill(websocket, bug_id)
     except Exception:
+        # Backfill failures should never sever the live connection.
+        logger.exception("ws_bug_logs: backfill failed for bug %d", bug_id)
+
+    try:
+        await _forward_until_disconnect(websocket, queue)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await bus.unsubscribe(topic_bug_logs(bug_id), queue)
+
+
+async def _send_log_backfill(websocket: WebSocket, bug_id: int) -> None:
+    """Tail the last N lines from the most recent agent_run's log file.
+
+    Emits them as ``agent_stdout_backfill`` frames with the same shape as
+    live ``agent_stdout`` frames plus a ``backfill: true`` marker, so the
+    frontend can dedupe / style them differently if it wants.
+    """
+    run_info = await asyncio.to_thread(_find_most_recent_run, bug_id)
+    if run_info is None:
         return
+    role, attempt, log_path_str = run_info
+    log_path = Path(log_path_str)
+    if not log_path.exists():
+        return
+
+    try:
+        text = await asyncio.to_thread(log_path.read_text, "utf-8")
+    except OSError:
+        return
+    lines = text.splitlines()
+    tail = lines[-LOG_BACKFILL_LINES:] if len(lines) > LOG_BACKFILL_LINES else lines
+    for line in tail:
+        if not line:
+            continue
+        try:
+            await websocket.send_json(
+                {
+                    "type": "agent_stdout",
+                    "bug_id": bug_id,
+                    "role": role,
+                    "attempt": attempt,
+                    "text": line,
+                    "backfill": True,
+                }
+            )
+        except Exception:
+            return
+
+
+def _find_most_recent_run(
+    bug_id: int,
+) -> tuple[str, int, str] | None:
+    """Return ``(role, attempt, log_path)`` for the latest agent run, or None."""
+    session = engine_module.SessionLocal()
+    try:
+        runs = repo_module.list_agent_runs(session, bug_id)
+        if not runs:
+            return None
+        last = runs[-1]
+        return (last.agent_role, last.attempt, last.log_path)
+    finally:
+        session.close()
 
 
 @router.websocket("/ws/test-instance")

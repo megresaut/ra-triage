@@ -14,11 +14,14 @@ frontend's `types.ts`.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Iterator
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -26,8 +29,11 @@ from ra_triage.db import engine as engine_module
 from ra_triage.db import repo
 from ra_triage.db.models import AgentRun, Bug
 from ra_triage.integrations.notion import NotionClient, normalize_page
+from ra_triage.orchestrator.pipeline import run_pipeline
 from ra_triage.orchestrator.states import BugState
 from ra_triage.settings import get_settings
+from ra_triage.triage_md import parser as triage_parser
+from ra_triage.workspaces import worktree as wt_module
 
 logger = logging.getLogger(__name__)
 
@@ -264,4 +270,150 @@ def poller_enqueue(
     )
     current_test = repo.get_current_test_instance(session)
     launched_bug_id = current_test.bug_id if current_test else None
+
+    # Kick off the pipeline without blocking the HTTP response. If the bug
+    # already existed (idempotent re-enqueue), we still schedule a task —
+    # the pipeline itself short-circuits on already-terminal/late states.
+    _schedule_pipeline(bug.id)
+
     return _bug_to_response(bug, launched_bug_id=launched_bug_id)
+
+
+def _schedule_pipeline(bug_id: int) -> None:
+    """Best-effort ``asyncio.create_task(run_pipeline(bug_id))``.
+
+    The endpoint runs on FastAPI's threadpool (sync def), so the running
+    asyncio loop is the FastAPI app loop. We find it via
+    ``asyncio.get_event_loop_policy().get_event_loop()`` when we're not on
+    the loop thread, and fall back to the bus's attached loop — the same
+    pattern ``EventBus.publish_sync`` uses.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is None:
+        # No loop on this thread — use the one the lifespan attached to
+        # the event bus. That's the FastAPI app loop.
+        from ra_triage.utils.events import bus
+
+        attached = bus.get_loop()
+        if attached is None:
+            logger.warning(
+                "Cannot schedule run_pipeline for bug %d: no running loop",
+                bug_id,
+            )
+            return
+        target_loop = attached
+        try:
+            target_loop.call_soon_threadsafe(
+                lambda: target_loop.create_task(run_pipeline(bug_id))
+            )
+        except RuntimeError:
+            logger.exception(
+                "Failed to schedule run_pipeline for bug %d", bug_id
+            )
+        return
+
+    loop.create_task(run_pipeline(bug_id))
+
+
+# --- TRIAGE.md & prompt endpoints (Agent 5) --------------------------
+
+
+class TriageResponse(BaseModel):
+    """Parsed TRIAGE.md payload for a bug."""
+
+    sections: dict[str, str]
+    raw: str
+    path: str
+
+
+@router.get("/bugs/{bug_id}/triage", response_model=TriageResponse)
+def get_triage_endpoint(
+    bug_id: int,
+    session: Session = Depends(get_session),
+) -> TriageResponse:
+    """Return parsed TRIAGE.md sections + raw content for a bug.
+
+    Strategy: identify the bug's primary (backend-first) worktree via the
+    project registry, then read ``<worktree>/TRIAGE.md`` from it. 404 if
+    no worktree exists on disk. Returns ``sections={}`` with an empty
+    ``raw`` if the worktree exists but TRIAGE.md has not been written
+    yet.
+    """
+    bug = repo.get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+
+    worktrees = wt_module.list_worktrees(bug_id)
+    if not worktrees:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No worktrees on disk for bug {bug_id}; pipeline may not have started",
+        )
+
+    triage_md = _pick_triage_md_path(bug.project_id, worktrees)
+    sections = triage_parser.parse(triage_md) if triage_md.exists() else {}
+    raw = triage_md.read_text(encoding="utf-8") if triage_md.exists() else ""
+    return TriageResponse(sections=sections, raw=raw, path=str(triage_md))
+
+
+def _pick_triage_md_path(project_id: str, worktrees: dict[str, Path]) -> Path:
+    """Return the TRIAGE.md path for the bug's primary worktree.
+
+    Mirrors ``orchestrator.pipeline._triage_md_worktree``: prefer the
+    backend repo, fall back to the first available worktree.
+    """
+    try:
+        from ra_triage.config.registry import get_project
+
+        project = get_project(project_id)
+    except KeyError:
+        return next(iter(worktrees.values())) / "TRIAGE.md"
+
+    for r in project.repos:
+        if r.role == "backend" and r.name in worktrees:
+            return worktrees[r.name] / "TRIAGE.md"
+    # fall back to first configured repo that actually has a worktree
+    for r in project.repos:
+        if r.name in worktrees:
+            return worktrees[r.name] / "TRIAGE.md"
+    return next(iter(worktrees.values())) / "TRIAGE.md"
+
+
+@router.get(
+    "/bugs/{bug_id}/prompt",
+    response_class=PlainTextResponse,
+    responses={
+        200: {"content": {"text/markdown": {}}, "description": "Rendered prompt"},
+        404: {"description": "Prompt not found on disk"},
+    },
+)
+def get_prompt_endpoint(
+    bug_id: int,
+    role: str = Query(..., description="Agent role, e.g. 'investigator'"),
+    attempt: int = Query(..., ge=1),
+    session: Session = Depends(get_session),
+) -> PlainTextResponse:
+    """Return the rendered prompt text for a specific (role, attempt).
+
+    Convenient for debugging agent output against the exact prompt the
+    CLI received. 404 if the prompt file is missing.
+    """
+    bug = repo.get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+
+    settings = get_settings()
+    prompt_path = settings.prompts_dir / str(bug_id) / f"{role}.{attempt}.md"
+    if not prompt_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Prompt not found: {prompt_path}",
+        )
+    return PlainTextResponse(
+        prompt_path.read_text(encoding="utf-8"),
+        media_type="text/markdown",
+    )

@@ -15,6 +15,13 @@ export type Repo = components["schemas"]["RepoResponse"];
 export type BugState = components["schemas"]["BugState"];
 export type PollerEnqueueRequest =
   components["schemas"]["PollerEnqueueRequest"];
+export type PullRequest = components["schemas"]["PullRequestResponse"];
+export type ConfirmResponse = components["schemas"]["ConfirmResponse"];
+export type RejectRequest = components["schemas"]["RejectRequest"];
+export type RejectResponse = components["schemas"]["RejectResponse"];
+export type CancelResponse = components["schemas"]["CancelResponse"];
+export type RetryResponse = components["schemas"]["RetryResponse"];
+export type TakeOverResponse = components["schemas"]["TakeOverResponse"];
 
 export interface HealthResponse {
   status: string;
@@ -51,6 +58,19 @@ async function apiGet<T>(path: string, opts: FetchOptions = {}): Promise<T> {
   return (await response.json()) as T;
 }
 
+/** Thrown by apiPost/apiGet when the backend returns a non-2xx. */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly detail: string;
+
+  constructor(path: string, status: number, detail: string) {
+    super(`POST ${path} failed: HTTP ${status}${detail ? ` — ${detail}` : ""}`);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 async function apiPost<T, B>(
   path: string,
   body: B,
@@ -64,7 +84,18 @@ async function apiPost<T, B>(
     signal: opts.signal,
   });
   if (!response.ok) {
-    throw new Error(`POST ${path} failed: HTTP ${response.status}`);
+    // Try to extract FastAPI's `detail` for a better message; fall back
+    // to the raw status.
+    let detail = "";
+    try {
+      const parsed = (await response.json()) as { detail?: string };
+      if (typeof parsed.detail === "string") {
+        detail = parsed.detail;
+      }
+    } catch {
+      // Ignore — non-JSON body.
+    }
+    throw new ApiError(path, response.status, detail);
   }
   return (await response.json()) as T;
 }
@@ -243,4 +274,73 @@ export async function fetchCurrentTestInstance(
 /** WebSocket URL for /ws/test-instance. */
 export function testInstanceWsUrl(): string {
   return "ws://127.0.0.1:5000/ws/test-instance";
+}
+
+// --- Agent 8 additions: Confirm / Reject / Cancel / Retry / Take Over ----
+
+/** POST /bugs/:id/confirm — starts the merge flow. */
+export async function confirmBug(
+  bugId: number,
+  signal?: AbortSignal,
+): Promise<ConfirmResponse> {
+  return apiPost<ConfirmResponse, Record<string, never>>(
+    `/bugs/${bugId}/confirm`,
+    {},
+    { signal },
+  );
+}
+
+/**
+ * POST /bugs/:id/reject — records a rejection reason and either re-runs
+ * the Investigator (count < 3) or pins the bug to BLOCKED (count == 3).
+ */
+export async function rejectBug(
+  bugId: number,
+  reason: string,
+  signal?: AbortSignal,
+): Promise<RejectResponse> {
+  return apiPost<RejectResponse, { reason: string }>(
+    `/bugs/${bugId}/reject`,
+    { reason },
+    { signal },
+  );
+}
+
+/** POST /bugs/:id/cancel — transitions the bug to CANCELLED + cleans up. */
+export async function cancelBug(
+  bugId: number,
+  signal?: AbortSignal,
+): Promise<CancelResponse> {
+  return apiPost<CancelResponse, Record<string, never>>(
+    `/bugs/${bugId}/cancel`,
+    {},
+    { signal },
+  );
+}
+
+/** POST /bugs/:id/retry — re-runs the most recent agent with attempt+1. */
+export async function retryBug(
+  bugId: number,
+  signal?: AbortSignal,
+): Promise<RetryResponse> {
+  return apiPost<RetryResponse, Record<string, never>>(
+    `/bugs/${bugId}/retry`,
+    {},
+    { signal },
+  );
+}
+
+/**
+ * POST /bugs/:id/take-over — marks the bug as taken over manually.
+ * Transitions to BLOCKED; the worktree is retained.
+ */
+export async function takeOverBug(
+  bugId: number,
+  signal?: AbortSignal,
+): Promise<TakeOverResponse> {
+  return apiPost<TakeOverResponse, Record<string, never>>(
+    `/bugs/${bugId}/take-over`,
+    {},
+    { signal },
+  );
 }

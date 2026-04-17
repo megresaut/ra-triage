@@ -177,8 +177,15 @@ async def _run_investigator(
     project: ProjectConfig,
     worktrees: dict[str, Path],
     triage_md_path: Path,
+    rejection_feedback: str | None = None,
 ) -> AgentResult:
-    """Spawn the Investigator, record its agent_runs row, return the result."""
+    """Spawn the Investigator, record its agent_runs row, return the result.
+
+    ``rejection_feedback`` is threaded into the prompt template's
+    ``{% if rejection_feedback %}`` block when the caller is the reject
+    flow (Agent 8's :func:`reinvestigate_with_feedback`). Forward-path
+    runs leave it ``None``.
+    """
     home_worktree = _triage_md_worktree(project, worktrees)
     attempt = await _next_attempt(bug_id, role="investigator")
     started_at = _utcnow()
@@ -224,7 +231,7 @@ async def _run_investigator(
             "paths": list(project.deny_list.paths),
             "categories": list(project.deny_list.categories),
         },
-        "rejection_feedback": None,
+        "rejection_feedback": rejection_feedback,
         "triage_md_path": str(triage_md_path),
         "attempt": attempt,
     }
@@ -1048,4 +1055,290 @@ def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-__all__ = ["run_pipeline"]
+# --- Agent 8: Reinvestigate + retry entry points -------------------------
+
+
+async def reinvestigate_with_feedback(
+    bug_id: int, rejection_feedback: str
+) -> None:
+    """Rerun the Investigator after a human reject.
+
+    Contract:
+      - Caller has already transitioned the bug to INVESTIGATING and
+        persisted the Rejection row (Agent 8's ``POST /bugs/:id/reject``
+        handler does both before spawning this task).
+      - We spawn the Investigator with ``rejection_feedback`` rendered
+        into the prompt template's ``{% if rejection_feedback %}`` block.
+      - On success we route forward exactly like the original Investigator
+        run — single-repo bugs enter FIXING, cross-repo go through the
+        stub cross-repo path until Agent 10 lands.
+      - Never raises: all exceptions land as BLOCKED like
+        :func:`run_pipeline`.
+    """
+    async with concurrency.PIPELINE_SEMAPHORE:
+        try:
+            await _reinvestigate_body(bug_id, rejection_feedback)
+        except Exception:
+            logger.exception(
+                "reinvestigate_with_feedback crashed for bug_id=%s", bug_id
+            )
+
+
+async def _reinvestigate_body(
+    bug_id: int, rejection_feedback: str
+) -> None:
+    bug_snapshot = await _load_bug(bug_id)
+    if bug_snapshot is None:
+        logger.warning(
+            "reinvestigate: bug_id=%s not found; aborting", bug_id
+        )
+        return
+    if _is_terminal(bug_snapshot["state"]):
+        return
+    if bug_snapshot["state"] != BugState.INVESTIGATING.value:
+        logger.warning(
+            "reinvestigate: bug %d not in INVESTIGATING (state=%s); aborting",
+            bug_id,
+            bug_snapshot["state"],
+        )
+        return
+
+    project = get_project(bug_snapshot["project_id"])
+    worktrees = wt_module.list_worktrees(bug_id)
+    if not worktrees:
+        # Worktrees were cleaned up (e.g. after a prior CANCELLED + re-open
+        # edge case). Recreate them.
+        try:
+            worktrees = await wt_module.create_worktrees_for_bug(
+                bug_id, project.repos
+            )
+        except wt_module.WorktreeError as exc:
+            logger.exception(
+                "reinvestigate: worktree recreate failed for bug %d", bug_id
+            )
+            await _block_with_escalation(
+                bug_id,
+                project=project,
+                reason_title="Worktree recreate failed during reinvestigation",
+                reason_body=str(exc),
+            )
+            return
+
+    triage_md_path = _triage_md_worktree(project, worktrees) / "TRIAGE.md"
+    triage_md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    result = await _run_investigator(
+        bug_id=bug_id,
+        project=project,
+        worktrees=worktrees,
+        triage_md_path=triage_md_path,
+        rejection_feedback=rejection_feedback,
+    )
+
+    await _route_after_investigator(
+        bug_id=bug_id,
+        project=project,
+        result=result,
+        triage_md_path=triage_md_path,
+    )
+
+
+async def retry_last_agent(bug_id: int) -> None:
+    """Re-run the most recent agent_runs row's role with attempt+1.
+
+    Supported starting states (the "working" states + BLOCKED when the
+    last run is a ``*_FAILED``):
+      INVESTIGATING, FIXING, TESTING, DESIGNING, FIXING_PARALLEL,
+      INTEGRATION_TESTING, BLOCKED.
+
+    The caller (Agent 8's ``/retry`` endpoint) validates the state before
+    spawning this task; here we re-verify and refuse with
+    :class:`ValueError` if the pipeline has since moved on.
+    """
+    async with concurrency.PIPELINE_SEMAPHORE:
+        await _retry_last_agent_body(bug_id)
+
+
+async def _retry_last_agent_body(bug_id: int) -> None:
+    bug_snapshot = await _load_bug(bug_id)
+    if bug_snapshot is None:
+        raise ValueError(f"bug {bug_id} not found")
+    state = BugState(bug_snapshot["state"])
+    if state not in _RETRY_ELIGIBLE_STATES:
+        raise ValueError(
+            f"bug {bug_id} is in {state.value}; retry is not allowed from this state"
+        )
+    latest = await _load_latest_agent_run(bug_id)
+    if latest is None:
+        raise ValueError(f"bug {bug_id} has no agent_runs to retry")
+
+    role = latest["agent_role"]
+    if state == BugState.BLOCKED:
+        # BLOCKED is only eligible if the latest run is a *_FAILED token —
+        # otherwise we'd accidentally re-run agents on escalation bugs.
+        tok = latest.get("completion_token") or ""
+        if not tok.endswith("_FAILED"):
+            raise ValueError(
+                f"bug {bug_id} is BLOCKED but latest agent_run "
+                f"(role={role!r}, token={tok!r}) is not a *_FAILED — "
+                "retry is only supported for explicit failures"
+            )
+
+    project = get_project(bug_snapshot["project_id"])
+    worktrees = wt_module.list_worktrees(bug_id)
+    if not worktrees:
+        try:
+            worktrees = await wt_module.create_worktrees_for_bug(
+                bug_id, project.repos
+            )
+        except wt_module.WorktreeError as exc:
+            await _block_with_escalation(
+                bug_id,
+                project=project,
+                reason_title="Worktree recreate failed during retry",
+                reason_body=str(exc),
+            )
+            return
+
+    triage_md_path = _triage_md_worktree(project, worktrees) / "TRIAGE.md"
+
+    if role == "investigator":
+        result = await _run_investigator(
+            bug_id=bug_id,
+            project=project,
+            worktrees=worktrees,
+            triage_md_path=triage_md_path,
+        )
+        await _route_after_investigator(
+            bug_id=bug_id,
+            project=project,
+            result=result,
+            triage_md_path=triage_md_path,
+        )
+        return
+
+    if role == "fixer":
+        # Ensure state is FIXING before re-running the Fixer. If we were
+        # in BLOCKED, transition back via FIXING.
+        await _transition_for_retry(bug_id, BugState.FIXING)
+        sections = triage_parser.parse(triage_md_path)
+        scope = triage_parser.get_scope(sections)
+        picked = _pick_single_affected_repo(project, scope)
+        if not isinstance(picked, RepoConfig):
+            # Can't pick a single repo — bail back to BLOCKED with a brief.
+            await _transition(bug_id, BugState.BLOCKED)
+            return
+        repo_config = picked
+        worktree = wt_module.path_for(bug_id, repo_config.name)
+        result = await _run_fixer(
+            bug_id=bug_id,
+            repo_config=repo_config,
+            worktree=worktree,
+            triage_md_path=triage_md_path,
+        )
+        if result.completion_token == "FIXER_COMPLETE":
+            # Continue the single-repo pipeline forward: → TESTING → RFR.
+            await _transition(bug_id, BugState.TESTING)
+            return
+        # Still failed — back to BLOCKED.
+        await _transition(bug_id, BugState.BLOCKED)
+        return
+
+    if role == "tester":
+        await _transition_for_retry(bug_id, BugState.TESTING)
+        sections = triage_parser.parse(triage_md_path)
+        scope = triage_parser.get_scope(sections)
+        picked = _pick_single_affected_repo(project, scope)
+        if not isinstance(picked, RepoConfig):
+            await _transition(bug_id, BugState.BLOCKED)
+            return
+        repo_config = picked
+        worktree = wt_module.path_for(bug_id, repo_config.name)
+        result = await _run_tester(
+            bug_id=bug_id,
+            repo_config=repo_config,
+            worktree=worktree,
+            triage_md_path=triage_md_path,
+        )
+        if result.completion_token == "TESTER_COMPLETE":
+            await _transition(bug_id, BugState.READY_FOR_REVIEW)
+            return
+        await _transition(bug_id, BugState.BLOCKED)
+        return
+
+    # Cross-repo roles land here until Agent 10 ships.
+    raise ValueError(
+        f"retry for agent role {role!r} is not yet implemented "
+        "(Agent 10 fills cross-repo)"
+    )
+
+
+#: States from which :func:`retry_last_agent` will accept a retry request.
+_RETRY_ELIGIBLE_STATES: frozenset[BugState] = frozenset(
+    {
+        BugState.INVESTIGATING,
+        BugState.DESIGNING,
+        BugState.FIXING,
+        BugState.FIXING_PARALLEL,
+        BugState.TESTING,
+        BugState.INTEGRATION_TESTING,
+        BugState.BLOCKED,
+    }
+)
+
+
+async def _transition_for_retry(bug_id: int, target: BugState) -> None:
+    """Walk the bug into ``target`` via a legal transition if possible.
+
+    From BLOCKED we go BLOCKED → FIXING (or FIXING_PARALLEL); from any
+    other state we only transition if the current state isn't already
+    ``target`` (idempotent).
+    """
+    bug_snapshot = await _load_bug(bug_id)
+    if bug_snapshot is None:
+        return
+    current = BugState(bug_snapshot["state"])
+    if current == target:
+        return
+    if current == BugState.BLOCKED and target in (
+        BugState.FIXING,
+        BugState.FIXING_PARALLEL,
+    ):
+        await _transition(bug_id, target)
+        return
+    if current == BugState.FIXING and target == BugState.TESTING:
+        await _transition(bug_id, target)
+        return
+    # Other paths: the caller guaranteed eligibility — we might not have a
+    # direct legal edge (e.g. TESTING → TESTING). Nothing to do.
+    return
+
+
+async def _load_latest_agent_run(bug_id: int) -> dict[str, Any] | None:
+    """Return the latest agent_runs row as a plain dict, or None if none exist."""
+    return await asyncio.to_thread(_load_latest_agent_run_sync, bug_id)
+
+
+def _load_latest_agent_run_sync(bug_id: int) -> dict[str, Any] | None:
+    session = engine_module.SessionLocal()
+    try:
+        runs = repo_module.list_agent_runs(session, bug_id)
+        if not runs:
+            return None
+        latest = runs[-1]
+        return {
+            "id": latest.id,
+            "agent_role": latest.agent_role,
+            "attempt": latest.attempt,
+            "completion_token": latest.completion_token,
+            "exit_code": latest.exit_code,
+        }
+    finally:
+        session.close()
+
+
+__all__ = [
+    "reinvestigate_with_feedback",
+    "retry_last_agent",
+    "run_pipeline",
+]

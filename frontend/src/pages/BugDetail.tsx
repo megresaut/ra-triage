@@ -4,6 +4,7 @@ import AgentTimeline from "@/components/AgentTimeline";
 import BugActionsMenu from "@/components/BugActionsMenu";
 import ConfirmRejectPanel from "@/components/ConfirmRejectPanel";
 import DiffViewer from "@/components/DiffViewer";
+import EscalationBrief from "@/components/EscalationBrief";
 import StatusBadge from "@/components/StatusBadge";
 import TestInstancePanel from "@/components/TestInstancePanel";
 import TriageMarkdown from "@/components/TriageMarkdown";
@@ -13,21 +14,9 @@ import { useTriage } from "@/hooks/useTriage";
 import type { Bug, PullRequest } from "@/lib/api";
 
 // Bug detail view — header + real TRIAGE.md + agent timeline (Agent 5)
-// + real Fixer diff viewer (Agent 6). Test instance, confirm/reject,
-// escalation brief remain labeled stubs for Agents 7–9 to fill in.
-
-function PlaceholderCard({ title, owner }: { title: string; owner: string }) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">{title}</CardTitle>
-      </CardHeader>
-      <CardContent className="text-sm text-muted-foreground">
-        Placeholder — {owner} wires this up.
-      </CardContent>
-    </Card>
-  );
-}
+// + real Fixer diff viewer (Agent 6). Escalation Brief (Agent 9) renders
+// prominently at the top of the detail view when the bug is BLOCKED with
+// an unresolved escalation row.
 
 function Field({ label, value }: { label: string; value: React.ReactNode }) {
   return (
@@ -193,6 +182,8 @@ export default function BugDetail() {
         </div>
       </div>
 
+      <EscalationBrief bugId={bug.id} state={bug.state} />
+
       <PullRequestsCard pull_requests={bug.pull_requests ?? []} />
 
       <DescriptionCard bug={bug} />
@@ -204,10 +195,6 @@ export default function BugDetail() {
       <DiffPanel bug={bug} />
       <TestInstancePanel bugId={bug.id} bugState={bug.state} />
       <ConfirmRejectPanel bug={bug} />
-      <PlaceholderCard
-        title="Escalation Brief actions (Agent 9)"
-        owner="Agent 9"
-      />
     </div>
   );
 }

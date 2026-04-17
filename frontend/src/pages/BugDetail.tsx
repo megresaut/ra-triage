@@ -1,13 +1,16 @@
 import { useParams } from "react-router-dom";
 
+import AgentTimeline from "@/components/AgentTimeline";
 import StatusBadge from "@/components/StatusBadge";
+import TriageMarkdown from "@/components/TriageMarkdown";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useBugDetail } from "@/hooks/useBugDetail";
+import { useTriage } from "@/hooks/useTriage";
 import type { Bug } from "@/lib/api";
 
-// Bug detail view — header + raw fields. Later agents layer richer panels
-// (TRIAGE.md, agent timeline, diff viewer, confirm/reject, escalation brief)
-// in place of the labeled placeholders below.
+// Bug detail view — header + real TRIAGE.md + agent timeline (Agent 5);
+// diff, test instance, confirm/reject, escalation brief remain labeled
+// stubs for Agents 6–9 to fill in.
 
 function PlaceholderCard({ title, owner }: { title: string; owner: string }) {
   return (
@@ -83,6 +86,60 @@ function DescriptionCard({ bug }: { bug: Bug }) {
   );
 }
 
+function TriagePanel({
+  bugId,
+  state,
+}: {
+  bugId: number;
+  state: string;
+}) {
+  const { data, isLoading, isError, error } = useTriage(bugId);
+
+  if (isLoading) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">TRIAGE.md</CardTitle>
+        </CardHeader>
+        <CardContent className="text-sm text-muted-foreground">
+          Loading…
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (isError) {
+    // 404 is common before the pipeline has created worktrees — don't
+    // treat it as loud error. Other errors surface red.
+    const msg = error instanceof Error ? error.message : "unknown error";
+    const is404 = msg.includes("404");
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">TRIAGE.md</CardTitle>
+        </CardHeader>
+        <CardContent className="text-sm">
+          {is404 ? (
+            <span className="text-muted-foreground">
+              No TRIAGE.md yet — the pipeline hasn't created a worktree.
+            </span>
+          ) : (
+            <span className="text-red-700">Failed to load: {msg}</span>
+          )}
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (!data) {
+    return null;
+  }
+
+  return (
+    <TriageMarkdown sections={data.sections} raw={data.raw} state={state} />
+  );
+}
+
 export default function BugDetail() {
   const { id } = useParams<{ id: string }>();
   const numericId = id ? Number.parseInt(id, 10) : undefined;
@@ -128,16 +185,14 @@ export default function BugDetail() {
       <DescriptionCard bug={bug} />
       <RawFieldsCard bug={bug} />
 
-      <PlaceholderCard title="Agent timeline (Agent 5)" owner="Agent 5" />
-      <PlaceholderCard title="TRIAGE.md (Agent 5)" owner="Agent 5" />
+      <AgentTimeline bugId={bug.id} />
+      <TriagePanel bugId={bug.id} state={bug.state} />
+
       <PlaceholderCard title="Diff viewer (Agent 6)" owner="Agent 6" />
       <PlaceholderCard title="Test instance (Agent 7)" owner="Agent 7" />
+      <PlaceholderCard title="Confirm / Reject (Agent 8)" owner="Agent 8" />
       <PlaceholderCard
-        title="Confirm / Reject (Agent 8)"
-        owner="Agent 8"
-      />
-      <PlaceholderCard
-        title="Escalation Brief (Agent 9)"
+        title="Escalation Brief actions (Agent 9)"
         owner="Agent 9"
       />
     </div>

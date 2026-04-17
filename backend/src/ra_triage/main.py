@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from ra_triage.api.bugs import router as bugs_router
+from ra_triage.api.escalations import router as escalations_router
 from ra_triage.api.projects import router as projects_router
 from ra_triage.api.test_instances import router as test_instances_router
 from ra_triage.api.ws import router as ws_router
@@ -96,6 +97,7 @@ def create_app() -> FastAPI:
 
     app.include_router(projects_router)
     app.include_router(bugs_router)
+    app.include_router(escalations_router)
     app.include_router(test_instances_router)
     app.include_router(ws_router)
 

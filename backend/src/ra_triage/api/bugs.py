@@ -1027,6 +1027,116 @@ def take_over_bug_endpoint(
     return TakeOverResponse(status="blocked", bug_id=bug_id)
 
 
+# --- Agent 9: Escalation read endpoint ------------------------------------
+
+
+class ParsedBriefOptionResponse(BaseModel):
+    """One option entry rendered for the frontend's escalation actions."""
+
+    id: str
+    label: str
+    kind: str
+
+
+class ParsedBriefResponse(BaseModel):
+    """Structured view of the Investigator's ``## Escalation Brief``."""
+
+    tldr: str | None
+    why_blocked: str | None
+    the_bug: str | None
+    why_change_necessary: str | None
+    proposed_approach: str | None
+    ranked_alternatives: list[str] = Field(default_factory=list)
+    files_that_would_be_touched: list[str] = Field(default_factory=list)
+    test_plan: str | None
+    options: list[ParsedBriefOptionResponse] = Field(default_factory=list)
+    raw: str
+
+
+class EscalationResponse(BaseModel):
+    """Full view of an unresolved ``escalations`` row + its parsed brief."""
+
+    id: int
+    bug_id: int
+    triggered_rule: str | None
+    created_at: datetime
+    parsed: ParsedBriefResponse
+
+
+@router.get(
+    "/bugs/{bug_id}/escalation",
+    response_model=EscalationResponse,
+    tags=["escalations"],
+)
+def get_escalation_endpoint(
+    bug_id: int,
+    session: Session = Depends(get_session),
+) -> EscalationResponse:
+    """Return the latest unresolved escalation for a bug.
+
+    404 if the bug doesn't exist or has no unresolved escalation row.
+    The parsed brief is re-derived on every request (the row only
+    stores the raw markdown + options JSON) so the frontend always sees
+    the current parse behavior.
+    """
+    bug = repo.get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+    escalation = repo.get_latest_unresolved_escalation(session, bug_id)
+    if escalation is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active (unresolved) escalation for bug {bug_id}",
+        )
+    parsed = triage_parser.parse_escalation_brief(
+        {"Escalation Brief": escalation.brief_markdown}
+    )
+    if parsed is None:
+        # Fall back to an empty shell with the raw body preserved so
+        # the frontend can at least render markdown.
+        return EscalationResponse(
+            id=escalation.id,
+            bug_id=escalation.bug_id,
+            triggered_rule=escalation.triggered_rule,
+            created_at=escalation.created_at,
+            parsed=ParsedBriefResponse(
+                tldr=None,
+                why_blocked=None,
+                the_bug=None,
+                why_change_necessary=None,
+                proposed_approach=None,
+                ranked_alternatives=[],
+                files_that_would_be_touched=[],
+                test_plan=None,
+                options=[],
+                raw=escalation.brief_markdown,
+            ),
+        )
+    return EscalationResponse(
+        id=escalation.id,
+        bug_id=escalation.bug_id,
+        triggered_rule=escalation.triggered_rule,
+        created_at=escalation.created_at,
+        parsed=ParsedBriefResponse(
+            tldr=parsed.tldr,
+            why_blocked=parsed.why_blocked,
+            the_bug=parsed.the_bug,
+            why_change_necessary=parsed.why_change_necessary,
+            proposed_approach=parsed.proposed_approach,
+            ranked_alternatives=list(parsed.ranked_alternatives),
+            files_that_would_be_touched=list(parsed.files_that_would_be_touched),
+            test_plan=parsed.test_plan,
+            options=[
+                ParsedBriefOptionResponse(
+                    id=o.id, label=o.label, kind=o.kind
+                )
+                for o in parsed.options
+            ],
+            raw=parsed.raw,
+        ),
+    )
+
+
 def _append_take_over_marker(bug: Bug) -> None:
     """Append a ``## Taken Over Manually`` section to TRIAGE.md."""
     try:

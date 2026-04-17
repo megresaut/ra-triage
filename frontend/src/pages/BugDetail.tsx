@@ -1,6 +1,8 @@
 import { useParams } from "react-router-dom";
 
 import AgentTimeline from "@/components/AgentTimeline";
+import BugActionsMenu from "@/components/BugActionsMenu";
+import ConfirmRejectPanel from "@/components/ConfirmRejectPanel";
 import DiffViewer from "@/components/DiffViewer";
 import StatusBadge from "@/components/StatusBadge";
 import TestInstancePanel from "@/components/TestInstancePanel";
@@ -8,7 +10,7 @@ import TriageMarkdown from "@/components/TriageMarkdown";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useBugDetail } from "@/hooks/useBugDetail";
 import { useTriage } from "@/hooks/useTriage";
-import type { Bug } from "@/lib/api";
+import type { Bug, PullRequest } from "@/lib/api";
 
 // Bug detail view — header + real TRIAGE.md + agent timeline (Agent 5)
 // + real Fixer diff viewer (Agent 6). Test instance, confirm/reject,
@@ -168,21 +170,30 @@ export default function BugDetail() {
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-2">
-        <div className="flex items-center gap-3">
-          <span className="font-mono text-sm text-muted-foreground">
-            #{bug.id}
-          </span>
-          <h1 className="text-2xl font-semibold tracking-tight">{bug.title}</h1>
-          <StatusBadge state={bug.state} />
-        </div>
-        <div className="text-sm text-muted-foreground">
-          <span>project: {bug.project_id}</span>
-          {" · "}
-          <span>severity: {bug.severity ?? "—"}</span>
-          {" · "}
-          <span>reporter: {bug.reporter ?? "—"}</span>
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center gap-3">
+              <span className="font-mono text-sm text-muted-foreground">
+                #{bug.id}
+              </span>
+              <h1 className="text-2xl font-semibold tracking-tight">
+                {bug.title}
+              </h1>
+              <StatusBadge state={bug.state} />
+            </div>
+            <div className="text-sm text-muted-foreground">
+              <span>project: {bug.project_id}</span>
+              {" · "}
+              <span>severity: {bug.severity ?? "—"}</span>
+              {" · "}
+              <span>reporter: {bug.reporter ?? "—"}</span>
+            </div>
+          </div>
+          <BugActionsMenu bug={bug} />
         </div>
       </div>
+
+      <PullRequestsCard pull_requests={bug.pull_requests ?? []} />
 
       <DescriptionCard bug={bug} />
       <RawFieldsCard bug={bug} />
@@ -192,12 +203,61 @@ export default function BugDetail() {
 
       <DiffPanel bug={bug} />
       <TestInstancePanel bugId={bug.id} bugState={bug.state} />
-      <PlaceholderCard title="Confirm / Reject (Agent 8)" owner="Agent 8" />
+      <ConfirmRejectPanel bug={bug} />
       <PlaceholderCard
         title="Escalation Brief actions (Agent 9)"
         owner="Agent 9"
       />
     </div>
+  );
+}
+
+function PullRequestsCard({
+  pull_requests,
+}: {
+  pull_requests: PullRequest[];
+}): JSX.Element | null {
+  if (pull_requests.length === 0) {
+    return null;
+  }
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Pull Requests</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-1 text-sm">
+        {pull_requests.map((pr) => (
+          <div key={pr.id} className="flex items-center gap-2">
+            <span className="font-mono text-xs text-muted-foreground">
+              {pr.repo_name}
+            </span>
+            {pr.pr_url ? (
+              <a
+                href={pr.pr_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-blue-700 underline"
+              >
+                PR #{pr.pr_number ?? "?"}
+              </a>
+            ) : (
+              <span className="text-muted-foreground">(pending)</span>
+            )}
+            <span
+              className={
+                pr.status === "merged"
+                  ? "text-green-700"
+                  : pr.status === "closed"
+                    ? "text-muted-foreground"
+                    : "text-amber-700"
+              }
+            >
+              {pr.status}
+            </span>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
   );
 }
 

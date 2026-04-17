@@ -187,3 +187,60 @@ export async function fetchDiffSummary(
     query: { repo },
   });
 }
+
+// --- Agent 7 additions: Launch for Testing -------------------------------
+
+/** Live (or "starting") test instance snapshot — matches /test-instances/current. */
+export interface TestInstance {
+  bug_id: number;
+  status: "starting" | "running" | "stopping" | "stopped" | "crashed" | "none";
+  ports: Record<string, number>;
+  pids: Record<string, number>;
+  db_snapshot_hash: string | null;
+  launched_at: string;
+  stopped_at?: string | null;
+  browser_port?: number | null;
+}
+
+/** POST /test-instances/launch. */
+export async function launchTestInstance(
+  bugId: number,
+  signal?: AbortSignal,
+): Promise<TestInstance> {
+  return apiPost<TestInstance, { bug_id: number }>(
+    "/test-instances/launch",
+    { bug_id: bugId },
+    { signal },
+  );
+}
+
+/** POST /test-instances/stop. */
+export async function stopTestInstance(
+  signal?: AbortSignal,
+): Promise<{ status: "stopped" | "none" }> {
+  return apiPost<{ status: "stopped" | "none" }, Record<string, never>>(
+    "/test-instances/stop",
+    {},
+    { signal },
+  );
+}
+
+/** GET /test-instances/current — 204 resolves to null. */
+export async function fetchCurrentTestInstance(
+  signal?: AbortSignal,
+): Promise<TestInstance | null> {
+  const url = `${BACKEND_BASE_URL}/test-instances/current`;
+  const response = await fetch(url, { signal });
+  if (response.status === 204) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(`GET /test-instances/current failed: HTTP ${response.status}`);
+  }
+  return (await response.json()) as TestInstance;
+}
+
+/** WebSocket URL for /ws/test-instance. */
+export function testInstanceWsUrl(): string {
+  return "ws://127.0.0.1:5000/ws/test-instance";
+}

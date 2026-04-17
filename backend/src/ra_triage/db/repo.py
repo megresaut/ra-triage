@@ -298,6 +298,81 @@ def get_current_test_instance(session: Session) -> TestInstance | None:
     return session.execute(stmt).scalar_one_or_none()
 
 
+def create_test_instance(
+    session: Session,
+    *,
+    bug_id: int,
+    pids: dict[str, int],
+    ports: dict[str, int],
+    status: str = "starting",
+    db_snapshot_hash: str | None = None,
+) -> TestInstance:
+    """Persist a new ``test_instances`` row.
+
+    ``pids`` and ``ports`` are ``{repo_name: value}`` maps serialized as
+    JSON (the ORM column is a plain TEXT, matching the Alembic schema).
+    Typical call sequence from :class:`TestInstanceManager`:
+
+      1. Create with ``status='starting'`` and empty maps before spawn.
+      2. Once spawn + readiness check succeed, flip to ``running`` via
+         :func:`update_test_instance_status` with the real pid/port maps.
+
+    Agent 7's manager calls this directly; the Agent 2 surface only ever
+    reads instances via :func:`get_current_test_instance`.
+    """
+    instance = TestInstance(
+        bug_id=bug_id,
+        pids=json.dumps(pids, sort_keys=True),
+        ports=json.dumps(ports, sort_keys=True),
+        db_snapshot_hash=db_snapshot_hash,
+        status=status,
+        launched_at=_utcnow(),
+    )
+    session.add(instance)
+    session.flush()
+    return instance
+
+
+def update_test_instance_status(
+    session: Session,
+    instance_id: int,
+    *,
+    status: str,
+    pids: dict[str, int] | None = None,
+    ports: dict[str, int] | None = None,
+    db_snapshot_hash: str | None = None,
+    stopped_at: datetime | None = None,
+) -> TestInstance:
+    """Update a ``test_instances`` row and return it.
+
+    Absent keyword arguments leave the corresponding column untouched — we
+    overwrite pids / ports / hash / stopped_at only when the caller passes a
+    value. ``stopped_at`` is automatically stamped to ``now`` when ``status``
+    flips to a terminal test-instance state (``stopped``, ``crashed``) and
+    the caller didn't supply an explicit value.
+
+    Raises ``ValueError`` if the instance_id is unknown — callers are
+    expected to hold the same ORM session that produced the row, so a miss
+    is a programming error, not a race.
+    """
+    instance = session.get(TestInstance, instance_id)
+    if instance is None:
+        raise ValueError(f"test_instances row {instance_id} not found")
+    instance.status = status
+    if pids is not None:
+        instance.pids = json.dumps(pids, sort_keys=True)
+    if ports is not None:
+        instance.ports = json.dumps(ports, sort_keys=True)
+    if db_snapshot_hash is not None:
+        instance.db_snapshot_hash = db_snapshot_hash
+    if stopped_at is not None:
+        instance.stopped_at = stopped_at
+    elif status in ("stopped", "crashed") and instance.stopped_at is None:
+        instance.stopped_at = _utcnow()
+    session.flush()
+    return instance
+
+
 # --- Utility -----------------------------------------------------------------
 
 

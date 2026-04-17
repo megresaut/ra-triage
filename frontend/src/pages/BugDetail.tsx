@@ -3,6 +3,7 @@ import { useParams } from "react-router-dom";
 import AgentTimeline from "@/components/AgentTimeline";
 import DiffViewer from "@/components/DiffViewer";
 import StatusBadge from "@/components/StatusBadge";
+import TestInstancePanel from "@/components/TestInstancePanel";
 import TriageMarkdown from "@/components/TriageMarkdown";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useBugDetail } from "@/hooks/useBugDetail";
@@ -190,7 +191,7 @@ export default function BugDetail() {
       <TriagePanel bugId={bug.id} state={bug.state} />
 
       <DiffPanel bug={bug} />
-      <PlaceholderCard title="Test instance (Agent 7)" owner="Agent 7" />
+      <TestInstancePanel bugId={bug.id} bugState={bug.state} />
       <PlaceholderCard title="Confirm / Reject (Agent 8)" owner="Agent 8" />
       <PlaceholderCard
         title="Escalation Brief actions (Agent 9)"

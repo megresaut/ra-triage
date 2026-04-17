@@ -19,8 +19,12 @@ Design:
 Topics used in this PR:
   - "bugs:queue" — queue-wide broadcast for state changes
   - "bugs:{bug_id}:state" — per-bug state change
-Agent 5 will add:
+Agent 5 added:
   - "bugs:{bug_id}:logs" — per-bug agent stdout
+Agent 7 added:
+  - "test-instance:logs" — log lines from the currently-running test instance
+  - "test-instance:status" — status transitions (starting/running/stopping/
+    stopped/crashed) for the currently-running test instance
 """
 
 from __future__ import annotations
@@ -142,6 +146,51 @@ def topic_bug_state(bug_id: int) -> str:
 def topic_bug_logs(bug_id: int) -> str:
     """Per-bug agent-stdout topic name."""
     return f"bugs:{bug_id}:logs"
+
+
+def topic_test_instance_logs() -> str:
+    """Current-test-instance log-line topic.
+
+    Singular — only one test instance exists at a time (single global lock
+    in ``test_runner.instance``), so we don't need per-instance fan-out.
+    """
+    return "test-instance:logs"
+
+
+def topic_test_instance_status() -> str:
+    """Current-test-instance status-transition topic."""
+    return "test-instance:status"
+
+
+def publish_test_instance_log(
+    *,
+    bug_id: int,
+    repo: str,
+    text: str,
+) -> None:
+    """Publish one dev-server stdout/stderr line onto the test-instance log topic.
+
+    Keep the shape stable — the WS handler at ``/ws/test-instance`` and the
+    frontend ``useTestInstanceLogs`` hook both assume ``type=="test_log"``
+    with exactly these keys.
+    """
+    payload: dict[str, Any] = {
+        "type": "test_log",
+        "bug_id": bug_id,
+        "repo": repo,
+        "line": text,
+    }
+    bus.publish_sync(topic_test_instance_logs(), payload)
+
+
+def publish_test_instance_status(payload: dict[str, Any]) -> None:
+    """Publish one status transition onto the test-instance status topic.
+
+    The caller builds the payload (so we don't hide which keys matter). We
+    just enforce the ``type`` discriminator.
+    """
+    frame = {"type": "test_instance_status", **payload}
+    bus.publish_sync(topic_test_instance_status(), frame)
 
 
 def publish_agent_stdout(

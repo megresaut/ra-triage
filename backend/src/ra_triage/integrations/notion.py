@@ -636,6 +636,61 @@ def status_writeback_for_state(bug: Any, new_state: BugState) -> None:
         )
 
 
+# --- PR-link write-back (Agent 8) -------------------------------------------
+
+
+def append_pr_link(
+    page_id: str,
+    pr_url: str,
+    repo_name: str,
+    note: str | None = None,
+) -> None:
+    """Append a PR link bullet to a Notion page.
+
+    Renders a line shaped like ``- PR (<repo_name>): <pr_url> — merged`` by
+    default, or with ``note`` substituted for "merged" if the caller wants
+    something else. Uses the configured NotionClient (via the same builder
+    plumbing as :func:`status_writeback_for_state`); silently no-ops if
+    Notion is unconfigured. Never raises — merge success must not be
+    reverted by a Notion outage.
+
+    Signature mirrors :func:`NotionClient.append_block` but handles the
+    markdown formatting + client construction so the merge driver can stay
+    compact.
+    """
+    if not page_id:
+        logger.debug("append_pr_link: empty page_id, skipping")
+        return
+
+    suffix = note if note is not None else "merged"
+    markdown = f"- PR ({repo_name}): {pr_url} — {suffix}\n"
+
+    builder = _current_client_builder()
+    try:
+        client = builder()
+    except Exception:
+        logger.exception("append_pr_link: failed to build NotionClient")
+        return
+    if client is None:
+        logger.debug(
+            "append_pr_link: NotionClient unconfigured, skipping (page_id=%s)",
+            page_id,
+        )
+        return
+    try:
+        client.append_block(page_id=page_id, markdown_text=markdown)
+        logger.info(
+            "Notion append_pr_link: page_id=%s repo=%s url=%s",
+            page_id,
+            repo_name,
+            pr_url,
+        )
+    except Exception:
+        logger.exception(
+            "Notion append_pr_link failed (page_id=%s, repo=%s)", page_id, repo_name
+        )
+
+
 __all__ = [
     "AVM_NOTION_STATUSES",
     "NormalizedBug",
@@ -643,6 +698,7 @@ __all__ = [
     "RawNotionBug",
     "RawNotionPage",
     "STATE_TO_NOTION_STATUS",
+    "append_pr_link",
     "configure_property_mapping",
     "normalize_page",
     "set_client_builder",

@@ -129,16 +129,69 @@ export interface paths {
         put?: never;
         /**
          * Poller Enqueue
-         * @description Manually enqueue a bug by `notion_page_id`.
+         * @description Enqueue a bug by `notion_page_id`.
          *
-         *     v1 debugging endpoint — Agent 3 will add the real Notion-driven polling
-         *     that populates title/description/etc. from the Notion page. Until then we
-         *     stub those fields so the pipeline can be exercised end-to-end.
+         *     Behavior:
+         *       - If `title` and `description` are provided in the body, use them
+         *         as-is (manual bypass — Agent 2's original behavior).
+         *       - If both are absent AND `NOTION_TOKEN` is configured, try fetching
+         *         the page from Notion and normalize it into bug fields. On Notion
+         *         fetch failure we fall back to the placeholder behavior and log.
+         *       - If both are absent and Notion isn't configured, use placeholders.
          *
          *     Idempotent: repeated calls with the same `notion_page_id` return the
-         *     existing bug row unchanged.
+         *     existing bug row unchanged regardless of which branch above fires.
          */
         post: operations["poller_enqueue_poller_enqueue_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/triage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Triage Endpoint
+         * @description Return parsed TRIAGE.md sections + raw content for a bug.
+         *
+         *     Strategy: identify the bug's primary (backend-first) worktree via the
+         *     project registry, then read ``<worktree>/TRIAGE.md`` from it. 404 if
+         *     no worktree exists on disk. Returns ``sections={}`` with an empty
+         *     ``raw`` if the worktree exists but TRIAGE.md has not been written
+         *     yet.
+         */
+        get: operations["get_triage_endpoint_bugs__bug_id__triage_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/prompt": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Prompt Endpoint
+         * @description Return the rendered prompt text for a specific (role, attempt).
+         *
+         *     Convenient for debugging agent output against the exact prompt the
+         *     CLI received. 404 if the prompt file is missing.
+         */
+        get: operations["get_prompt_endpoint_bugs__bug_id__prompt_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -306,6 +359,20 @@ export interface components {
             github_origin: string;
             /** Main Branch */
             main_branch: string;
+        };
+        /**
+         * TriageResponse
+         * @description Parsed TRIAGE.md payload for a bug.
+         */
+        TriageResponse: {
+            /** Sections */
+            sections: {
+                [key: string]: string;
+            };
+            /** Raw */
+            raw: string;
+            /** Path */
+            path: string;
         };
         /** ValidationError */
         ValidationError: {
@@ -518,6 +585,80 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["BugResponse"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_triage_endpoint_bugs__bug_id__triage_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TriageResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_prompt_endpoint_bugs__bug_id__prompt_get: {
+        parameters: {
+            query: {
+                /** @description Agent role, e.g. 'investigator' */
+                role: string;
+                attempt: number;
+            };
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Rendered prompt */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                    "text/markdown": unknown;
+                };
+            };
+            /** @description Prompt not found on disk */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

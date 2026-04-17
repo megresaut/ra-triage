@@ -71,3 +71,28 @@ def test_publish_sync_without_loop_is_silent() -> None:
     bus = EventBus()
     # No running loop in a plain sync test — must not raise.
     bus.publish_sync("anything", {"x": 1})
+
+
+@pytest.mark.asyncio
+async def test_publish_agent_stdout_shape() -> None:
+    """``publish_agent_stdout`` emits a standard agent_stdout payload."""
+    from ra_triage.utils.events import bus as global_bus
+    from ra_triage.utils.events import publish_agent_stdout, topic_bug_logs
+
+    queue = await global_bus.subscribe(topic_bug_logs(77))
+    publish_agent_stdout(bug_id=77, role="investigator", attempt=2, text="hello")
+    payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+    assert payload == {
+        "type": "agent_stdout",
+        "bug_id": 77,
+        "role": "investigator",
+        "attempt": 2,
+        "text": "hello",
+    }
+    await global_bus.unsubscribe(topic_bug_logs(77), queue)
+
+
+def test_get_loop_returns_none_without_attachment() -> None:
+    """Fresh bus with no attached loop returns None."""
+    bus = EventBus()
+    assert bus.get_loop() is None

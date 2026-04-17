@@ -46,6 +46,19 @@ class EventBus:
         """Forget the registered loop (app shutdown / test teardown)."""
         self._loop = None
 
+    def get_loop(self) -> asyncio.AbstractEventLoop | None:
+        """Return the registered loop (or None).
+
+        Public accessor so sync callers outside the bus can dispatch
+        coroutines onto the FastAPI app loop without reaching into the
+        bus's private ``_loop`` attribute. Returns ``None`` if no loop is
+        attached or the attached loop is closed.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return None
+        return loop
+
     async def subscribe(self, topic: str) -> asyncio.Queue[dict[str, Any]]:
         """Register a new subscriber on `topic` and return its queue.
 
@@ -127,5 +140,29 @@ def topic_bug_state(bug_id: int) -> str:
 
 
 def topic_bug_logs(bug_id: int) -> str:
-    """Per-bug agent-stdout topic name (Agent 5 fills in the publisher)."""
+    """Per-bug agent-stdout topic name."""
     return f"bugs:{bug_id}:logs"
+
+
+def publish_agent_stdout(
+    bug_id: int, role: str, attempt: int, text: str
+) -> None:
+    """Publish one agent stdout line onto ``bugs:{bug_id}:logs``.
+
+    Thin wrapper so every caller emits the same payload shape — the WS
+    handler at ``/ws/bugs/:id/logs`` and the frontend ``useLiveLogs`` hook
+    both assume ``type=="agent_stdout"`` with the exact keys below. Keep the
+    shape stable.
+
+    Uses ``publish_sync`` so the base-class subprocess streamer can call this
+    from an async reader task without awaiting (matches existing
+    state-change publishers in ``db.repo``).
+    """
+    payload: dict[str, Any] = {
+        "type": "agent_stdout",
+        "bug_id": bug_id,
+        "role": role,
+        "attempt": attempt,
+        "text": text,
+    }
+    bus.publish_sync(topic_bug_logs(bug_id), payload)

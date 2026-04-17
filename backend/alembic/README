@@ -1,0 +1,6 @@
+Alembic migrations for RA Triage.
+
+Generated via `make db-init` (which runs `alembic upgrade head`). The initial
+migration (`0001_initial_schema.py`) creates the full v1 schema in one shot
+per tech plan §3. Subsequent migrations should be added by later agents as
+the schema evolves.

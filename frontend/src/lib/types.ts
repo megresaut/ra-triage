@@ -482,6 +482,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/bugs/{bug_id}/clear-manual-review-flag": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Clear Manual Review Flag Endpoint
+         * @description Clear the ``needs_manual_review`` flag the resume path set.
+         *
+         *     Triggered by the yellow banner's "Dismiss" button in the frontend.
+         *     Idempotent: clearing an already-cleared flag returns 200 with the
+         *     flag set to ``False``. Does not touch state, PRs, or TRIAGE.md —
+         *     the operator has acknowledged the inconsistency, but the audit
+         *     trail (``## Needs Manual Review`` section) stays as a permanent
+         *     record.
+         */
+        post: operations["clear_manual_review_flag_endpoint_bugs__bug_id__clear_manual_review_flag_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/bugs/{bug_id}/escalation/approve": {
         parameters: {
             query?: never;
@@ -737,6 +764,11 @@ export interface components {
              * @default false
              */
             launched_for_testing: boolean;
+            /**
+             * Needs Manual Review
+             * @default false
+             */
+            needs_manual_review: boolean;
             /** Pull Requests */
             pull_requests?: components["schemas"]["PullRequestResponse"][];
         };
@@ -757,6 +789,18 @@ export interface components {
             status: string;
             /** Bug Id */
             bug_id: number;
+        };
+        /**
+         * ClearManualReviewFlagResponse
+         * @description Response for ``POST /bugs/{bug_id}/clear-manual-review-flag``.
+         */
+        ClearManualReviewFlagResponse: {
+            /** Status */
+            status: string;
+            /** Bug Id */
+            bug_id: number;
+            /** Needs Manual Review */
+            needs_manual_review: boolean;
         };
         /**
          * ConfirmResponse
@@ -1768,6 +1812,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RetryFixerWithConflictResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    clear_manual_review_flag_endpoint_bugs__bug_id__clear_manual_review_flag_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClearManualReviewFlagResponse"];
                 };
             };
             /** @description Validation Error */

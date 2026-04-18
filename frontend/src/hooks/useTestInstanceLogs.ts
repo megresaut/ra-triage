@@ -23,6 +23,12 @@ export interface TestInstanceStatusFrame {
   stopped_at?: string | null;
   browser_port?: number | null;
   row_id?: number;
+  // Agent 12: populated on crashed frames — reason + last 20 lines
+  // of each proc's log file so the panel can show the immediate
+  // diagnostic without making the operator chase the log path.
+  reason?: string;
+  log_tails?: Record<string, string[]>;
+  dead_procs?: string[];
 }
 
 interface TestLogFrame {

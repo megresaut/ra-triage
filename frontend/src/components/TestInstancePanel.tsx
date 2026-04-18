@@ -118,6 +118,7 @@ export default function TestInstancePanel({
             is available again.
           </p>
         )}
+        <CrashDiagnostic />
         {otherBugRunning && instance !== null && (
           <p className="text-sm text-muted-foreground">
             Another bug is currently launched:{" "}
@@ -137,6 +138,49 @@ export default function TestInstancePanel({
         />
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * Agent 12: when the reaper broadcasts a crashed frame with a log tail,
+ * show the per-repo tail inline so the operator sees the immediate cause
+ * without scrolling through the live-log pane (which may have been
+ * cleared by the reconnect).
+ */
+function CrashDiagnostic() {
+  const { status } = useTestInstanceLogs();
+  if (status === null || status.status !== "crashed") {
+    return null;
+  }
+  const tails = status.log_tails ?? {};
+  const repos = Object.keys(tails).sort();
+  if (repos.length === 0) {
+    return null;
+  }
+  return (
+    <div className="space-y-2 rounded-md border border-red-200 bg-red-50 p-3">
+      <div className="text-xs font-semibold text-red-800">
+        Crash diagnostic{" "}
+        {status.reason && (
+          <span className="font-mono">({status.reason})</span>
+        )}
+      </div>
+      {status.dead_procs && status.dead_procs.length > 0 && (
+        <div className="text-xs text-red-700">
+          Dead procs: <span className="font-mono">{status.dead_procs.join(", ")}</span>
+        </div>
+      )}
+      {repos.map((r) => (
+        <details key={r} open>
+          <summary className="cursor-pointer text-xs text-red-700">
+            {r} (last {tails[r]?.length ?? 0} lines)
+          </summary>
+          <pre className="mt-1 max-h-48 overflow-auto rounded bg-slate-950 p-2 text-[10px] leading-snug text-slate-100">
+            {(tails[r] ?? []).join("\n")}
+          </pre>
+        </details>
+      ))}
+    </div>
   );
 }
 

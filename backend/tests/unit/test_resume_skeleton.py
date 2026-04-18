@@ -1,4 +1,14 @@
-"""Tests for ``ra_triage.orchestrator.resume.resume_inflight`` (skeleton)."""
+"""Compat tests for ``ra_triage.orchestrator.resume.resume_inflight``.
+
+These tests originated as the Agent 5 skeleton smoke tests (resume_inflight
+returned ``list[int]``). Agent 12 reshapes the API to return
+``list[ResumeReport]``; the comparison helpers on ResumeReport accept ints
+in equality checks so the legacy assertions still hold.
+
+Detailed Agent 12 behavior is exercised by ``test_resume.py`` — these
+tests stay as a smoke layer that proves the basic API shape is preserved
+across the upgrade.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +37,6 @@ def _seed_bug(
         title="x",
         description="y",
     )
-    # Walk into the target state via legal transitions.
     if state == BugState.OPEN:
         session.commit()
         return int(bug.id)
@@ -72,23 +81,24 @@ async def test_resume_inflight_returns_non_terminal_bug_ids(
     finally:
         session.close()
 
-    observed = await resume_module.resume_inflight()
+    reports = await resume_module.resume_inflight()
 
-    assert set(observed) == non_term_ids
+    observed_ids = {r.bug_id for r in reports}
+    assert observed_ids == non_term_ids
 
 
 async def test_resume_inflight_handles_empty_db(
     alembic_db: Path, triage_home: Path
 ) -> None:
     """No bugs in DB → empty list, no error."""
-    observed = await resume_module.resume_inflight()
-    assert observed == []
+    reports = await resume_module.resume_inflight()
+    assert reports == []
 
 
 async def test_resume_inflight_inspects_latest_agent_run(
     alembic_db: Path, triage_home: Path
 ) -> None:
-    """When a bug has prior agent_runs, the log line includes the role + attempt."""
+    """When a bug has prior agent_runs, the resume report still surfaces it."""
     session = engine_module.SessionLocal()
     try:
         bug_id = _seed_bug(
@@ -99,6 +109,7 @@ async def test_resume_inflight_inspects_latest_agent_run(
             agent_role="investigator",
             attempt=1,
             started_at=_now(),
+            ended_at=_now(),
             log_path="/tmp/x.log",
             prompt_path="/tmp/x.md",
             completion_token="INVESTIGATOR_COMPLETE",
@@ -106,43 +117,15 @@ async def test_resume_inflight_inspects_latest_agent_run(
         )
         session.add(run)
         session.commit()
-        # Sanity checks before the assertion block below.
         assert repo_module.get_bug(session, bug_id) is not None
         runs = repo_module.list_agent_runs(session, bug_id)
         assert len(runs) == 1
     finally:
         session.close()
 
-    # Capture log calls by attaching a handler to the resume module's
-    # logger. We use a custom handler rather than caplog because
-    # pytest-asyncio sometimes swaps capture fixtures around awaits.
-    import logging
+    reports = await resume_module.resume_inflight()
 
-    records: list[logging.LogRecord] = []
-
-    class _Capturer(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            records.append(record)
-
-    handler = _Capturer(logging.DEBUG)
-    resume_module.logger.addHandler(handler)
-    prior_level = resume_module.logger.level
-    # pytest's log-capture plugin sets ``logger.disabled=True`` during
-    # the setup phase; we need to flip it back to emit our records.
-    prior_disabled = resume_module.logger.disabled
-    resume_module.logger.disabled = False
-    resume_module.logger.setLevel(logging.DEBUG)
-    try:
-        observed = await resume_module.resume_inflight()
-    finally:
-        resume_module.logger.removeHandler(handler)
-        resume_module.logger.setLevel(prior_level)
-        resume_module.logger.disabled = prior_disabled
-
-    assert bug_id in observed, f"observed={observed}"
-    joined = "\n".join(r.getMessage() for r in records)
-    assert records, (
-        f"Expected at least one log record; got none. observed={observed}"
-    )
-    assert "investigator" in joined
-    assert "INVESTIGATOR_COMPLETE" in joined
+    matching = [r for r in reports if r.bug_id == bug_id]
+    assert matching, f"reports={reports}"
+    # A clean COMPLETE run on an INVESTIGATING bug → RESUME_PIPELINE.
+    assert matching[0].decision == resume_module.ResumeDecision.RESUME_PIPELINE

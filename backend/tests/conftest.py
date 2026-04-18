@@ -60,6 +60,29 @@ def triage_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pat
     settings_module.get_settings.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_shutdown_flag() -> Iterator[None]:
+    """Reset Agent 12's process-wide shutdown flag between tests.
+
+    FastAPI ``TestClient`` enters + exits the lifespan context per test,
+    and the lifespan-exit hook calls ``graceful_shutdown`` which trips
+    the flag. Without this reset, the next test's pipeline coroutines
+    observe the flag and bail at their first checkpoint.
+
+    We reset BEFORE each test (not after) so failures that raise mid-test
+    still leave a clean slate for the next one.
+    """
+    from ra_triage.orchestrator import shutdown as shutdown_module
+
+    shutdown_module.reset_for_tests()
+    # Re-import-style refresh: other modules import ``shutdown`` as a
+    # name at module import time, so we also swap the attribute on
+    # every live import.
+    import ra_triage.orchestrator.shutdown as _s  # noqa: F401
+
+    yield
+
+
 @pytest.fixture()
 def alembic_db(triage_home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Apply the Alembic migration to a fresh DB inside `triage_home`.

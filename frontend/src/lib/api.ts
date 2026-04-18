@@ -547,3 +547,27 @@ export async function retryFixerWithConflict(
     { signal },
   );
 }
+
+// --- Agent 12 additions: needs-manual-review flag ------------------------
+
+/** Response from POST /bugs/:id/clear-manual-review-flag. */
+export interface ClearManualReviewFlagResult {
+  status: string;
+  bug_id: number;
+  needs_manual_review: boolean;
+}
+
+/**
+ * POST /bugs/:id/clear-manual-review-flag — dismiss the yellow
+ * "needs manual review" banner the resume path set at boot. Idempotent.
+ */
+export async function clearManualReviewFlag(
+  bugId: number,
+  signal?: AbortSignal,
+): Promise<ClearManualReviewFlagResult> {
+  return apiPost<ClearManualReviewFlagResult, Record<string, never>>(
+    `/bugs/${bugId}/clear-manual-review-flag`,
+    {},
+    { signal },
+  );
+}

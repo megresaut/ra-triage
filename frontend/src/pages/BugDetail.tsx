@@ -6,6 +6,8 @@ import ConfirmRejectPanel from "@/components/ConfirmRejectPanel";
 import ConflictPanel from "@/components/ConflictPanel";
 import DiffViewer from "@/components/DiffViewer";
 import EscalationBrief from "@/components/EscalationBrief";
+import NeedsManualReviewBanner from "@/components/NeedsManualReviewBanner";
+import RestartRecoveryNotice from "@/components/RestartRecoveryNotice";
 import StatusBadge from "@/components/StatusBadge";
 import TestInstancePanel from "@/components/TestInstancePanel";
 import TriageMarkdown from "@/components/TriageMarkdown";
@@ -139,6 +141,7 @@ export default function BugDetail() {
   const { id } = useParams<{ id: string }>();
   const numericId = id ? Number.parseInt(id, 10) : undefined;
   const { data: bug, isError, isLoading, error } = useBugDetail(numericId);
+  const { data: triage } = useTriage(numericId);
 
   if (isLoading) {
     return <p className="text-sm text-muted-foreground">Loading bug…</p>;
@@ -183,6 +186,12 @@ export default function BugDetail() {
           <BugActionsMenu bug={bug} />
         </div>
       </div>
+
+      <NeedsManualReviewBanner
+        bugId={bug.id}
+        needsManualReview={bug.needs_manual_review ?? false}
+      />
+      <RestartRecoveryNotice triage={triage} />
 
       <EscalationBrief bugId={bug.id} state={bug.state} />
 

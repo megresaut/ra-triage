@@ -118,6 +118,12 @@ class BugResponse(BaseModel):
     current_agent: str | None = None
     conflict_files: list[str] | None = None
     launched_for_testing: bool = False
+    # Agent 12: True when ``orchestrator.resume`` flagged the bug as
+    # needing human attention because its state was inconsistent with
+    # the agent_runs trail at boot. The frontend renders a yellow
+    # banner; the operator dismisses via
+    # ``POST /bugs/{id}/clear-manual-review-flag``.
+    needs_manual_review: bool = False
     pull_requests: list[PullRequestResponse] = Field(default_factory=list)
 
 
@@ -186,6 +192,7 @@ def _bug_to_response(bug: Bug, *, launched_bug_id: int | None) -> BugResponse:
         # this to decide whether to render.
         conflict_files=repo.parse_conflict_files(bug.conflict_files),
         launched_for_testing=(launched_bug_id is not None and launched_bug_id == bug.id),
+        needs_manual_review=bool(getattr(bug, "needs_manual_review", False)),
         pull_requests=prs,
     )
 
@@ -1361,4 +1368,46 @@ def retry_fixer_with_conflict_endpoint(
         status="retrying",
         bug_id=bug_id,
         new_state=projected,
+    )
+
+
+# --- Agent 12: clear-manual-review-flag endpoint -------------------------
+
+
+class ClearManualReviewFlagResponse(BaseModel):
+    """Response for ``POST /bugs/{bug_id}/clear-manual-review-flag``."""
+
+    status: str
+    bug_id: int
+    needs_manual_review: bool
+
+
+@router.post(
+    "/bugs/{bug_id}/clear-manual-review-flag",
+    response_model=ClearManualReviewFlagResponse,
+    tags=["review"],
+)
+def clear_manual_review_flag_endpoint(
+    bug_id: int,
+    session: Session = Depends(get_session),
+) -> ClearManualReviewFlagResponse:
+    """Clear the ``needs_manual_review`` flag the resume path set.
+
+    Triggered by the yellow banner's "Dismiss" button in the frontend.
+    Idempotent: clearing an already-cleared flag returns 200 with the
+    flag set to ``False``. Does not touch state, PRs, or TRIAGE.md —
+    the operator has acknowledged the inconsistency, but the audit
+    trail (``## Needs Manual Review`` section) stays as a permanent
+    record.
+    """
+    bug = repo.get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+    bug.needs_manual_review = False
+    session.flush()
+    session.commit()
+    return ClearManualReviewFlagResponse(
+        status="cleared",
+        bug_id=bug_id,
+        needs_manual_review=False,
     )

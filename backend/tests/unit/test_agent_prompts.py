@@ -91,6 +91,7 @@ def test_fixer_frontend_template_renders_minimal_context() -> None:
             },
             "triage_md_path": "/tmp/wt/42/avm-backend/TRIAGE.md",
             "escalation_context": None,
+            "conflict_context": None,
         },
     )
     assert "## Fixer-Frontend Notes" in out
@@ -116,6 +117,7 @@ def test_fixer_backend_template_renders_minimal_context() -> None:
             },
             "triage_md_path": "/tmp/wt/42/avm-backend/TRIAGE.md",
             "escalation_context": None,
+            "conflict_context": None,
         },
     )
     assert "## Fixer-Backend Notes" in out
@@ -136,10 +138,53 @@ def test_fixer_frontend_template_renders_escalation_context() -> None:
             "deny_list": {"paths": [], "categories": []},
             "triage_md_path": "/tmp/TRIAGE.md",
             "escalation_context": "Reviewer picked Alternative 2: use soft-delete instead of hard-delete.",
+            "conflict_context": None,
         },
     )
     assert "HUMAN-APPROVED ESCALATION CONTEXT" in out
     assert "Alternative 2" in out
+
+
+def test_fixer_frontend_template_renders_conflict_context() -> None:
+    """Agent 11: conflict context block renders when provided."""
+    out = _render(
+        "fixer_frontend.md.j2",
+        {
+            "bug": {"id": 42, "title": "broken shape"},
+            "side": "Frontend",
+            "worktree_path": "/tmp/wt",
+            "build_command": "npx tsc --noEmit",
+            "deny_list": {"paths": [], "categories": []},
+            "triage_md_path": "/tmp/TRIAGE.md",
+            "escalation_context": None,
+            "conflict_context": (
+                "Repo: builder-frontend\nConflicting files:\n  - src/InvoiceForm.tsx"
+            ),
+        },
+    )
+    assert "PRIOR FIX HAD A MERGE CONFLICT" in out
+    assert "InvoiceForm.tsx" in out
+
+
+def test_fixer_backend_template_renders_conflict_context() -> None:
+    """Agent 11: conflict context block renders for the backend Fixer too."""
+    out = _render(
+        "fixer_backend.md.j2",
+        {
+            "bug": {"id": 42, "title": "broken shape"},
+            "side": "Backend",
+            "worktree_path": "/tmp/wt",
+            "build_command": "go build ./...",
+            "deny_list": {"paths": [], "categories": []},
+            "triage_md_path": "/tmp/TRIAGE.md",
+            "escalation_context": None,
+            "conflict_context": (
+                "Repo: avm-backend\nConflicting files:\n  - api/handlers.go"
+            ),
+        },
+    )
+    assert "PRIOR FIX HAD A MERGE CONFLICT" in out
+    assert "api/handlers.go" in out
 
 
 # --- integration_tester.md.j2 ---------------------------------------------

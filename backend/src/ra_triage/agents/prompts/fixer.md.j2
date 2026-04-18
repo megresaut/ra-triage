@@ -14,6 +14,17 @@ HUMAN-APPROVED ESCALATION CONTEXT. Incorporate this guidance into your fix:
 {{ escalation_context }}
 {% endif %}
 
+{% if conflict_context %}
+PRIOR FIX HAD A MERGE CONFLICT WHEN A SIBLING BUG MERGED FIRST. Resolve by
+incorporating both changes:
+
+{{ conflict_context }}
+
+The conflicted files are listed above. Re-apply your fix on top of the new
+main, ensuring you do not undo the recently-merged changes from the trigger
+bug. After resolving, re-run the build and proceed.
+{% endif %}
+
 CONSTRAINTS
   - Modify only files inside {{ worktree_path }}.
   - Do NOT touch test files; that is the Tester's job.

@@ -381,6 +381,193 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/bugs/{bug_id}/escalation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Escalation Endpoint
+         * @description Return the latest unresolved escalation for a bug.
+         *
+         *     404 if the bug doesn't exist or has no unresolved escalation row.
+         *     The parsed brief is re-derived on every request (the row only
+         *     stores the raw markdown + options JSON) so the frontend always sees
+         *     the current parse behavior.
+         */
+        get: operations["get_escalation_endpoint_bugs__bug_id__escalation_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/rebase-attempts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Rebase Attempts Endpoint
+         * @description Return the audit list of rebase attempts for a bug, oldest-first.
+         */
+        get: operations["list_rebase_attempts_endpoint_bugs__bug_id__rebase_attempts_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/conflict-diff": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Conflict Diff Endpoint
+         * @description Return a ``git diff origin/<main>...HEAD`` snapshot for the bug's
+         *     conflict worktree.
+         *
+         *     Used by the frontend's ConflictPanel to display the diff context
+         *     alongside the file list. Returns an empty diff string if the
+         *     worktree is gone or git failed — the UI degrades to "(no snapshot
+         *     available)".
+         *
+         *     404 if the bug doesn't exist, doesn't have a conflict, or the
+         *     inferred repo_name isn't in the project registry.
+         */
+        get: operations["get_conflict_diff_endpoint_bugs__bug_id__conflict_diff_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/retry-fixer-with-conflict": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry Fixer With Conflict Endpoint
+         * @description Kick off the retry-Fixer-with-conflict-context flow.
+         *
+         *     Validates that the bug is BLOCKED AND has a non-null
+         *     ``conflict_files`` column. Returns 202 immediately; the pipeline
+         *     coroutine runs as a background task and handles the BLOCKED →
+         *     FIXING (or FIXING_PARALLEL) transition + conflict_context threading.
+         *
+         *     409 if the bug is not in BLOCKED or has no active conflict.
+         */
+        post: operations["retry_fixer_with_conflict_endpoint_bugs__bug_id__retry_fixer_with_conflict_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/escalation/approve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve Escalation
+         * @description Approve the Investigator's recommended fix.
+         *
+         *     - ``option_id`` must be ``"approve_recommended"`` (defence-in-depth:
+         *       the frontend only offers this value, but a malformed payload
+         *       deserves a clear 400).
+         *     - The bug must be in ``BLOCKED`` with an unresolved escalation row.
+         *     - Transitions BLOCKED → FIXING (single-repo) or FIXING_PARALLEL
+         *       (cross-repo) based on the bug's ``scope`` column, then schedules
+         *       :func:`run_pipeline_with_escalation_context` so the Fixer
+         *       receives the approved brief.
+         */
+        post: operations["approve_escalation_bugs__bug_id__escalation_approve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/escalation/pick-alternative": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Pick Alternative
+         * @description Pick a specific alternative from the Escalation Brief.
+         *
+         *     - ``option_id`` must be one of the ``alternative_N`` entries in the
+         *       escalation's stored ``options`` list.
+         *     - ``notes`` (optional, 500 chars max) lets the reviewer add
+         *       free-text guidance that gets appended to the ``escalation_context``
+         *       string handed to the Fixer.
+         *     - Transitions + scheduling are identical to approve.
+         */
+        post: operations["pick_alternative_bugs__bug_id__escalation_pick_alternative_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/bugs/{bug_id}/escalation/take-over": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Take Over Escalation
+         * @description Mark the escalation taken-over manually; bug stays in BLOCKED.
+         *
+         *     Unlike :func:`ra_triage.api.bugs.take_over_bug_endpoint`, which can be
+         *     invoked from any non-terminal state, this endpoint is specifically
+         *     scoped to resolving an active escalation row:
+         *
+         *       - Bug must be in ``BLOCKED`` with an unresolved escalation.
+         *       - Records ``resolution='taken_over'`` + ``resolved_option='take_over'``.
+         *       - Appends a ``## Taken Over Manually`` section to TRIAGE.md (shared
+         *         with the generic take-over flow).
+         *       - Does NOT clean up the worktree. Does NOT change the bug state.
+         */
+        post: operations["take_over_escalation_bugs__bug_id__escalation_take_over_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/test-instances/launch": {
         parameters: {
             query?: never;
@@ -484,6 +671,14 @@ export interface components {
             worktree_repo: string | null;
         };
         /**
+         * ApproveRequest
+         * @description Body for ``POST /bugs/{bug_id}/escalation/approve``.
+         */
+        ApproveRequest: {
+            /** Option Id */
+            option_id: string;
+        };
+        /**
          * BugResponse
          * @description Public view of a bug.
          *
@@ -574,6 +769,18 @@ export interface components {
             bug_id: number;
         };
         /**
+         * ConflictDiffResponse
+         * @description Snapshot of the diff surface for a BLOCKED-with-conflict bug.
+         */
+        ConflictDiffResponse: {
+            /** Bug Id */
+            bug_id: number;
+            /** Repo Name */
+            repo_name: string;
+            /** Diff */
+            diff: string;
+        };
+        /**
          * DiffResponse
          * @description Unified diff of a bug's worktree vs ``origin/<main_branch>``.
          */
@@ -600,6 +807,40 @@ export interface components {
             insertions: number;
             /** Deletions */
             deletions: number;
+        };
+        /**
+         * EscalationActionResponse
+         * @description Response for approve / pick-alternative.
+         */
+        EscalationActionResponse: {
+            /** Status */
+            status: string;
+            /** Bug Id */
+            bug_id: number;
+            /** Escalation Id */
+            escalation_id: number;
+            /** New State */
+            new_state: string;
+            /** Resolved Option */
+            resolved_option: string;
+        };
+        /**
+         * EscalationResponse
+         * @description Full view of an unresolved ``escalations`` row + its parsed brief.
+         */
+        EscalationResponse: {
+            /** Id */
+            id: number;
+            /** Bug Id */
+            bug_id: number;
+            /** Triggered Rule */
+            triggered_rule: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            parsed: components["schemas"]["ParsedBriefResponse"];
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -637,6 +878,54 @@ export interface components {
             launched_at: string;
             /** Browser Port */
             browser_port?: number | null;
+        };
+        /**
+         * ParsedBriefOptionResponse
+         * @description One option entry rendered for the frontend's escalation actions.
+         */
+        ParsedBriefOptionResponse: {
+            /** Id */
+            id: string;
+            /** Label */
+            label: string;
+            /** Kind */
+            kind: string;
+        };
+        /**
+         * ParsedBriefResponse
+         * @description Structured view of the Investigator's ``## Escalation Brief``.
+         */
+        ParsedBriefResponse: {
+            /** Tldr */
+            tldr: string | null;
+            /** Why Blocked */
+            why_blocked: string | null;
+            /** The Bug */
+            the_bug: string | null;
+            /** Why Change Necessary */
+            why_change_necessary: string | null;
+            /** Proposed Approach */
+            proposed_approach: string | null;
+            /** Ranked Alternatives */
+            ranked_alternatives?: string[];
+            /** Files That Would Be Touched */
+            files_that_would_be_touched?: string[];
+            /** Test Plan */
+            test_plan: string | null;
+            /** Options */
+            options?: components["schemas"]["ParsedBriefOptionResponse"][];
+            /** Raw */
+            raw: string;
+        };
+        /**
+         * PickAlternativeRequest
+         * @description Body for ``POST /bugs/{bug_id}/escalation/pick-alternative``.
+         */
+        PickAlternativeRequest: {
+            /** Option Id */
+            option_id: string;
+            /** Notes */
+            notes?: string | null;
         };
         /**
          * PollerEnqueueRequest
@@ -703,6 +992,29 @@ export interface components {
             created_at: string;
         };
         /**
+         * RebaseAttemptResponse
+         * @description Public view of a ``rebase_attempts`` row for audit display.
+         */
+        RebaseAttemptResponse: {
+            /** Id */
+            id: number;
+            /** Bug Id */
+            bug_id: number;
+            /** Repo Name */
+            repo_name: string;
+            /** Trigger Bug Id */
+            trigger_bug_id: number;
+            /** Result */
+            result: string;
+            /** Conflict Files */
+            conflict_files?: string[];
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+        };
+        /**
          * RejectRequest
          * @description Body for ``POST /bugs/{bug_id}/reject``.
          */
@@ -747,6 +1059,18 @@ export interface components {
             main_branch: string;
         };
         /**
+         * RetryFixerWithConflictResponse
+         * @description Response for ``POST /bugs/:id/retry-fixer-with-conflict``.
+         */
+        RetryFixerWithConflictResponse: {
+            /** Status */
+            status: string;
+            /** Bug Id */
+            bug_id: number;
+            /** New State */
+            new_state: string;
+        };
+        /**
          * RetryResponse
          * @description Response for ``POST /bugs/{bug_id}/retry``.
          */
@@ -767,6 +1091,20 @@ export interface components {
         StopResponse: {
             /** Status */
             status: string;
+        };
+        /**
+         * TakeOverEscalationResponse
+         * @description Response for take-over.
+         */
+        TakeOverEscalationResponse: {
+            /** Status */
+            status: string;
+            /** Bug Id */
+            bug_id: number;
+            /** Escalation Id */
+            escalation_id: number;
+            /** Resolved Option */
+            resolved_option: string;
         };
         /**
          * TakeOverResponse
@@ -1303,6 +1641,234 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TakeOverResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_escalation_endpoint_bugs__bug_id__escalation_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EscalationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_rebase_attempts_endpoint_bugs__bug_id__rebase_attempts_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RebaseAttemptResponse"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_conflict_diff_endpoint_bugs__bug_id__conflict_diff_get: {
+        parameters: {
+            query?: {
+                /** @description Repo the conflict occurred in. Optional — if omitted, the most recent conflict row's repo is used. */
+                repo?: string | null;
+            };
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConflictDiffResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retry_fixer_with_conflict_endpoint_bugs__bug_id__retry_fixer_with_conflict_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetryFixerWithConflictResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    approve_escalation_bugs__bug_id__escalation_approve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApproveRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EscalationActionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    pick_alternative_bugs__bug_id__escalation_pick_alternative_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PickAlternativeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EscalationActionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    take_over_escalation_bugs__bug_id__escalation_take_over_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bug_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TakeOverEscalationResponse"];
                 };
             };
             /** @description Validation Error */

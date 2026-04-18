@@ -45,6 +45,7 @@ from ra_triage.orchestrator.states import (
     IllegalBugStateTransition,
 )
 from ra_triage.triage_md import parser as triage_parser
+from ra_triage.workspaces import rebase as rebase_module
 from ra_triage.workspaces import worktree as wt_module
 
 logger = logging.getLogger(__name__)
@@ -249,6 +250,17 @@ async def _merge_bug_body(bug_id: int) -> None:
                     bug_id,
                     repo_name,
                 )
+
+    # Agent 11: schedule the rebase sweeper for every repo this bug
+    # touched. Each sweep rebases all OTHER in-flight bugs against the
+    # newly-merged main. Fire-and-forget — the sweep runs as background
+    # tasks on the event loop and publishes its own events via
+    # ``update_bug_state`` on any conflict transitions.
+    _schedule_rebase_sweeps(
+        trigger_bug_id=bug_id,
+        project=project,
+        merged_repos=[name for name, _u, _n in merged_prs],
+    )
 
     try:
         await wt_module.cleanup(bug_id, list(project.repos))
@@ -681,6 +693,55 @@ def _resolve_triage_md_path(bug_id: int, project: ProjectConfig) -> Path:
     return (
         get_settings().worktrees_dir / str(bug_id) / ".escalation" / "TRIAGE.md"
     )
+
+
+def _schedule_rebase_sweeps(
+    *,
+    trigger_bug_id: int,
+    project: ProjectConfig,
+    merged_repos: list[str],
+) -> None:
+    """Fire-and-forget a rebase sweep task for each merged repo.
+
+    Agent 11 wiring: after a bug transitions to FIXED, schedule one
+    background task per affected repo that rebases every OTHER in-flight
+    bug's worktree against the newly-updated ``origin/<main>``. The
+    sweep never blocks the merge API response; it publishes
+    ``state_change`` events via :func:`db.repo.update_bug_state` on any
+    conflict transitions so WS subscribers pick them up.
+
+    Failures here never propagate — if the loop isn't available or
+    ``asyncio.create_task`` refuses, we log and continue.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning(
+            "rebase sweep: no running loop when trigger=%d finished merging; "
+            "skipping sweep — next merge will retry for in-flight peers",
+            trigger_bug_id,
+        )
+        return
+
+    for repo_name in merged_repos:
+        coro = rebase_module.rebase_in_flight(
+            trigger_bug_id=trigger_bug_id,
+            repo_name=repo_name,
+            project=project,
+        )
+        try:
+            loop.create_task(
+                coro,
+                name=f"rebase_sweep:{trigger_bug_id}:{repo_name}",
+            )
+        except RuntimeError:
+            logger.exception(
+                "rebase sweep: failed to schedule trigger=%d repo=%s",
+                trigger_bug_id,
+                repo_name,
+            )
+            if hasattr(coro, "close"):
+                coro.close()
 
 
 __all__ = ["merge_bug"]

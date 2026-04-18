@@ -18,6 +18,16 @@ HUMAN-APPROVED ESCALATION CONTEXT. Incorporate this guidance into your fix:
 {{ escalation_context }}
 {% endif %}
 
+{% if conflict_context %}
+PRIOR FIX HAD A MERGE CONFLICT WHEN A SIBLING BUG MERGED FIRST. Resolve by
+incorporating both changes:
+
+{{ conflict_context }}
+
+Re-apply your fix on top of the new main without undoing the trigger bug's
+changes. After resolving, re-run the build and proceed.
+{% endif %}
+
 CONSTRAINTS
   - Modify only files in this repo ({{ worktree_path }}). The shared
     TRIAGE.md at {{ triage_md_path }} (lives in the backend worktree)

@@ -24,6 +24,7 @@ from ra_triage.db.models import (
     Bug,
     Escalation,
     PullRequest,
+    RebaseAttempt,
     Rejection,
     TestInstance,
 )
@@ -675,3 +676,206 @@ def parse_affected_repos(raw: str | None) -> list[str]:
     if isinstance(value, list):
         return [str(v) for v in value]
     return []
+
+
+def parse_conflict_files(raw: str | None) -> list[str] | None:
+    """Parse the ``bugs.conflict_files`` JSON column into a list or None.
+
+    Returns ``None`` (not ``[]``) when the column is NULL so the frontend
+    can distinguish "no conflict" (None) from "conflict with empty file
+    list" (a weird state we never intentionally produce, but we handle
+    it as an empty list for safety).
+    """
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return None
+
+
+# --- Agent 11: rebase sweeper support ---------------------------------------
+
+
+#: States that represent in-flight bug work. A bug in any of these states may
+#: hold a worktree that needs rebasing when a sibling bug's PR merges. MERGING
+#: is deliberately EXCLUDED because that bug is itself being merged (rebasing
+#: it mid-merge would be racy); terminal states are excluded for obvious
+#: reasons.
+_INFLIGHT_STATES: tuple[str, ...] = (
+    BugState.TRIAGED.value,
+    BugState.INVESTIGATING.value,
+    BugState.DESIGNING.value,
+    BugState.FIXING.value,
+    BugState.FIXING_PARALLEL.value,
+    BugState.TESTING.value,
+    BugState.INTEGRATION_TESTING.value,
+    BugState.READY_FOR_REVIEW.value,
+    BugState.BLOCKED.value,
+)
+
+
+def list_inflight_for_repo(
+    session: Session,
+    repo_name: str,
+    *,
+    exclude_bug_id: int | None = None,
+) -> list[Bug]:
+    """Return non-terminal, non-MERGING bugs whose ``affected_repos`` includes ``repo_name``.
+
+    Used by the rebase sweeper (:func:`workspaces.rebase.rebase_in_flight`)
+    when a trigger bug finishes merging — it walks every other in-flight
+    bug touching the same repo and attempts an automatic ``git rebase
+    origin/<main>``.
+
+    Filtering rules:
+      - State must be in :data:`_INFLIGHT_STATES` (excludes terminal states
+        and MERGING — a bug being merged RIGHT NOW must not race rebase).
+      - ``affected_repos`` JSON must contain ``repo_name``.
+      - ``exclude_bug_id`` (the trigger bug) is filtered out.
+
+    Returned list is ordered by ``id ASC`` so callers see deterministic
+    ordering across the sweep. The function is sync + session-bound; the
+    orchestrator dispatches it on :func:`asyncio.to_thread` from the
+    async sweep task.
+    """
+    stmt = (
+        select(Bug)
+        .where(Bug.state.in_(_INFLIGHT_STATES))
+        .order_by(Bug.id.asc())
+    )
+    if exclude_bug_id is not None:
+        stmt = stmt.where(Bug.id != exclude_bug_id)
+    bugs = list(session.execute(stmt).scalars())
+    # Filter on the JSON ``affected_repos`` column in Python — SQLite doesn't
+    # give us portable JSON containment queries and the in-flight set is
+    # small (hard capped by PIPELINE_SEMAPHORE=3).
+    out: list[Bug] = []
+    for b in bugs:
+        names = parse_affected_repos(b.affected_repos)
+        if repo_name in names:
+            out.append(b)
+    return out
+
+
+def record_rebase_attempt(
+    session: Session,
+    *,
+    bug_id: int,
+    repo_name: str,
+    trigger_bug_id: int,
+    result: str,
+    conflict_files: list[str] | None = None,
+) -> RebaseAttempt:
+    """Persist an audit row for one rebase attempt.
+
+    ``result`` is one of ``"clean"``, ``"conflict"``, ``"error"``. ``conflict_files``
+    is a list of paths (encoded as JSON in the text column) on ``"conflict"``;
+    ``None`` on the other results.
+
+    Raises :class:`ValueError` for an unknown result string so typos don't
+    silently produce bogus audit rows.
+    """
+    if result not in ("clean", "conflict", "error"):
+        raise ValueError(
+            f"record_rebase_attempt: result must be 'clean'|'conflict'|'error', got {result!r}"
+        )
+    files_json: str | None = None
+    if conflict_files is not None:
+        files_json = json.dumps(list(conflict_files))
+    row = RebaseAttempt(
+        bug_id=bug_id,
+        repo_name=repo_name,
+        trigger_bug_id=trigger_bug_id,
+        result=result,
+        conflict_files=files_json,
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def list_rebase_attempts(session: Session, bug_id: int) -> list[RebaseAttempt]:
+    """Return every ``rebase_attempts`` row for ``bug_id``, oldest-first."""
+    stmt = (
+        select(RebaseAttempt)
+        .where(RebaseAttempt.bug_id == bug_id)
+        .order_by(RebaseAttempt.created_at.asc(), RebaseAttempt.id.asc())
+    )
+    return list(session.execute(stmt).scalars())
+
+
+def mark_blocked_with_conflict(
+    session: Session,
+    bug_id: int,
+    repo_name: str,
+    conflict_files: list[str],
+) -> Bug:
+    """Flip a bug to BLOCKED + stamp ``bugs.conflict_files`` with the conflict list.
+
+    Also ensures the LATEST ``rebase_attempts`` row for this bug/repo has
+    its ``conflict_files`` column populated — the sweeper normally calls
+    :func:`record_rebase_attempt` first to insert the audit row, and this
+    helper backfills the file list onto that row in the same session.
+
+    Transition semantics:
+      - From an in-flight state (FIXING, FIXING_PARALLEL, TESTING,
+        INTEGRATION_TESTING, READY_FOR_REVIEW, INVESTIGATING, DESIGNING,
+        TRIAGED) → BLOCKED via :func:`update_bug_state`.
+      - If the bug is ALREADY BLOCKED, we just stamp the column and
+        audit-row fields without trying to transition (that would raise
+        :class:`IllegalBugStateTransition`).
+      - If the bug is terminal or MERGING, we leave state alone and stamp
+        the column + audit row anyway — the caller already filtered via
+        :func:`list_inflight_for_repo`, so this is a defensive branch.
+
+    Returns the (possibly-updated) bug so callers can publish events or
+    re-render without a second fetch.
+    """
+    bug = session.get(Bug, bug_id)
+    if bug is None:
+        raise ValueError(f"mark_blocked_with_conflict: unknown bug_id={bug_id}")
+
+    # Stamp the denorm column first so observers watching the state_change
+    # event see the conflict_files already populated.
+    bug.conflict_files = json.dumps(list(conflict_files))
+    bug.updated_at = _utcnow()
+
+    current = BugState(bug.state)
+    if current not in TERMINAL_STATES and current not in (
+        BugState.BLOCKED,
+        BugState.MERGING,
+    ):
+        # Go through the state machine so the hook fires.
+        update_bug_state(session, bug, BugState.BLOCKED)
+    else:
+        session.flush()
+
+    # Backfill the conflict_files list onto the most recent ``rebase_attempts``
+    # row for (bug_id, repo_name) so the audit trail is fully populated.
+    attempts = list_rebase_attempts(session, bug_id)
+    matching = [a for a in attempts if a.repo_name == repo_name]
+    if matching:
+        latest = matching[-1]
+        latest.conflict_files = json.dumps(list(conflict_files))
+        session.flush()
+
+    return bug
+
+
+def clear_conflict_files(session: Session, bug_id: int) -> None:
+    """Null out ``bugs.conflict_files`` — called when a conflict is resolved.
+
+    The retry-fixer-with-conflict flow (:func:`orchestrator.pipeline.retry_fixer_with_conflict`)
+    fires this when it transitions BLOCKED → FIXING so the frontend no
+    longer renders the conflict panel once the Fixer is re-engaged.
+    """
+    bug = session.get(Bug, bug_id)
+    if bug is None:
+        return
+    bug.conflict_files = None
+    bug.updated_at = _utcnow()
+    session.flush()

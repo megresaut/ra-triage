@@ -464,3 +464,86 @@ export async function takeOverEscalation(
     { signal },
   );
 }
+
+// --- Agent 11 additions: Rebase / conflict surface ----------------------
+
+/** One row from the ``rebase_attempts`` audit table. */
+export interface RebaseAttempt {
+  id: number;
+  bug_id: number;
+  repo_name: string;
+  trigger_bug_id: number;
+  result: "clean" | "conflict" | "error";
+  conflict_files: string[];
+  created_at: string;
+}
+
+/** Snapshot of the conflict diff for a BLOCKED-with-conflict bug. */
+export interface ConflictDiff {
+  bug_id: number;
+  repo_name: string;
+  diff: string;
+}
+
+/** Response from POST /bugs/:id/retry-fixer-with-conflict. */
+export interface RetryFixerWithConflictResult {
+  status: string;
+  bug_id: number;
+  new_state: string;
+}
+
+/**
+ * GET /bugs/:id/rebase-attempts — every rebase attempt the sweeper
+ * has made for this bug, oldest first.
+ */
+export async function fetchRebaseAttempts(
+  bugId: number,
+  signal?: AbortSignal,
+): Promise<RebaseAttempt[]> {
+  return apiGet<RebaseAttempt[]>(`/bugs/${bugId}/rebase-attempts`, {
+    signal,
+  });
+}
+
+/**
+ * GET /bugs/:id/conflict-diff — diff snapshot for the conflict
+ * worktree. Resolves to ``{diff: ""}`` if the worktree was cleaned up
+ * or git failed; the frontend renders a "(no snapshot)" fallback.
+ *
+ * Resolves to ``null`` on 404 (no active conflict) so callers can
+ * conditionally render without a loud error.
+ */
+export async function fetchConflictDiff(
+  bugId: number,
+  repo?: string,
+  signal?: AbortSignal,
+): Promise<ConflictDiff | null> {
+  const url = `${BACKEND_BASE_URL}/bugs/${bugId}/conflict-diff${
+    repo ? `?repo=${encodeURIComponent(repo)}` : ""
+  }`;
+  const response = await fetch(url, { signal });
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(
+      `GET /bugs/${bugId}/conflict-diff failed: HTTP ${response.status}`,
+    );
+  }
+  return (await response.json()) as ConflictDiff;
+}
+
+/**
+ * POST /bugs/:id/retry-fixer-with-conflict — re-run the Fixer with
+ * the conflict files + diff snapshot threaded into the prompt.
+ */
+export async function retryFixerWithConflict(
+  bugId: number,
+  signal?: AbortSignal,
+): Promise<RetryFixerWithConflictResult> {
+  return apiPost<RetryFixerWithConflictResult, Record<string, never>>(
+    `/bugs/${bugId}/retry-fixer-with-conflict`,
+    {},
+    { signal },
+  );
+}

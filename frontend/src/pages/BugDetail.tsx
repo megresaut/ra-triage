@@ -3,6 +3,7 @@ import { useParams } from "react-router-dom";
 import AgentTimeline from "@/components/AgentTimeline";
 import BugActionsMenu from "@/components/BugActionsMenu";
 import ConfirmRejectPanel from "@/components/ConfirmRejectPanel";
+import ConflictPanel from "@/components/ConflictPanel";
 import DiffViewer from "@/components/DiffViewer";
 import EscalationBrief from "@/components/EscalationBrief";
 import StatusBadge from "@/components/StatusBadge";
@@ -184,6 +185,8 @@ export default function BugDetail() {
       </div>
 
       <EscalationBrief bugId={bug.id} state={bug.state} />
+
+      <ConflictPanel bug={bug} />
 
       <PullRequestsCard pull_requests={bug.pull_requests ?? []} />
 

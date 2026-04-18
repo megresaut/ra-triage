@@ -11,12 +11,33 @@ interface BugRowProps {
   bug: Bug;
 }
 
-function conflictLabel(bug: Bug): string {
+// Returns a small badge node for the conflict column. Agent 11: when
+// the rebase sweeper marks a bug BLOCKED with conflict_files, render a
+// red dot + the file count so the queue surfaces conflicting bugs at a
+// glance. The tooltip carries the full file list so a hover gives the
+// reviewer the names without leaving the queue.
+function conflictBadge(bug: Bug): JSX.Element {
   const files = bug.conflict_files;
   if (!files || files.length === 0) {
-    return "—";
+    return <span className="text-muted-foreground">—</span>;
   }
-  return files.length === 1 ? "1 file" : `${files.length} files`;
+  const count = files.length;
+  const label = count === 1 ? "1 file" : `${count} files`;
+  const tooltip = files.join("\n");
+  return (
+    <span
+      className="inline-flex items-center gap-1 text-red-700"
+      title={tooltip}
+      aria-label={`Merge conflict on ${label}`}
+      data-testid="conflict-badge"
+    >
+      <span
+        className="inline-block h-2 w-2 rounded-full bg-red-600"
+        aria-hidden="true"
+      />
+      {label}
+    </span>
+  );
 }
 
 export default function BugRow({ bug }: BugRowProps) {
@@ -48,9 +69,7 @@ export default function BugRow({ bug }: BugRowProps) {
       <TableCell className="text-center text-sm">
         {bug.rejection_count}
       </TableCell>
-      <TableCell className="text-sm text-muted-foreground">
-        {conflictLabel(bug)}
-      </TableCell>
+      <TableCell className="text-sm">{conflictBadge(bug)}</TableCell>
       <TableCell className="text-center">
         {bug.launched_for_testing ? (
           <span

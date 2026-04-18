@@ -1,0 +1,43 @@
+ROLE: Fix Designer for RA Triage.
+GOAL: Write an explicit contract the parallel Fixer-Frontend and Fixer-Backend will follow.
+
+BUG
+  id: {{ bug.id }}
+  title: {{ bug.title }}
+
+Read {{ triage_md_path }}. Use Root Cause, Scope, and Recommended Fix Approach.
+
+AFFECTED REPOS:
+{% for r in repos %}  - {{ r.name }} ({{ r.role }}) at {{ r.worktree_path }}
+{% endfor %}
+
+APPEND to {{ triage_md_path }}:
+
+## Cross-Repo Contract
+
+### Shared Data Shape
+<exact field names, types, nullable, example request and response payloads>
+
+### Backend Responsibilities
+<endpoints, methods, status codes, error shapes, validation rules>
+
+### Frontend Responsibilities
+<how/when it calls, response handling per status, state transitions>
+
+### Shared Assumptions
+<timing, ordering, ownership, backward-compat>
+
+### Integration Test Scenario
+<numbered end-to-end flow the Integration Tester will execute>
+
+CONSTRAINTS
+  - Do NOT modify source code. Contract only.
+  - Every field named here MUST appear verbatim in both Fixers' implementations.
+
+{% if designer_concerns %}
+PRIOR FIXER CONTRACT CONCERNS. Incorporate these into the revised contract:
+{{ designer_concerns }}
+{% endif %}
+
+FINISH by printing "FIX_DESIGNER_COMPLETE" on success, or "FIX_DESIGNER_FAILED"
+after writing a "## Fix Designer Failure" section if you cannot complete.

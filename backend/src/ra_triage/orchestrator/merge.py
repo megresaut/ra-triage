@@ -85,7 +85,21 @@ async def merge_bug(bug_id: int) -> None:
 
 
 async def _merge_bug_body(bug_id: int) -> None:
-    """Actual merge driver — split out so the entry point is a thin try/except."""
+    """Actual merge driver — split out so the entry point is a thin try/except.
+
+    Cross-repo strategy (two-pass cross-ref):
+      1. Create ALL PRs first, each with a placeholder cross-ref note in
+         the body (e.g. "Related PR will be linked here"). Creation order
+         is registry order (backend first, then frontend).
+      2. For each PR, run ``gh pr edit --body-file`` to REWRITE the body
+         with a top-placed "> Related PR: <other_pr_url>" header pointing
+         at the OTHER repo's PR.
+      3. Merge the PRs in registry order (backend → frontend).
+      4. On full success: transition to FIXED, append Notion PR links.
+      5. If the frontend merge fails after the backend merged, append a
+         ``## Partial Merge`` section and transition to BLOCKED. The
+         backend merge is NOT auto-reverted.
+    """
     bug_dict = await _load_bug(bug_id)
     if bug_dict is None:
         logger.warning("merge_bug: bug_id=%s not found; aborting", bug_id)
@@ -133,13 +147,16 @@ async def _merge_bug_body(bug_id: int) -> None:
     if not await _transition(bug_id, BugState.MERGING):
         return
 
-    # Build the per-repo merge plan. We iterate in registry order —
-    # backend first, frontend after — per tech plan §12.2.
-    merged_prs: list[tuple[str, str, int]] = []  # (repo_name, url, pr_number)
+    is_cross_repo = len(repos_to_merge) > 1
+
+    # --- Pass 1: create ALL PRs ---------------------------------------
+    # For cross-repo we seed each PR with a "related PR will be linked
+    # here" placeholder note so the body mentions the cross-ref concept
+    # even before pass 2 runs. Pass 2 rewrites the body with the real
+    # URL once every PR exists.
     try:
+        pr_infos: list[tuple[RepoConfig, PRInfo]] = []
         for repo_cfg in repos_to_merge:
-            # Cancel check before each repo — Megha may have clicked
-            # Cancel between backend and frontend merges.
             fresh = await _load_bug(bug_id)
             if fresh is None or BugState(fresh["state"]) in TERMINAL_STATES:
                 logger.info(
@@ -147,31 +164,63 @@ async def _merge_bug_body(bug_id: int) -> None:
                     bug_id,
                 )
                 return
-
+            cross_note = (
+                "> Related PR will be linked here once the other repo's PR is created."
+                if is_cross_repo
+                else None
+            )
             pr_info = await _ensure_pr_created(
                 bug_id=bug_id,
                 repo_cfg=repo_cfg,
                 project=project,
+                cross_ref_body_note=cross_note,
             )
+            pr_infos.append((repo_cfg, pr_info))
+
+        # --- Pass 2: rewrite each PR body with the other PR's URL -----
+        # Only runs for cross-repo — for single-repo the initial body is
+        # already correct.
+        if is_cross_repo:
+            await _update_cross_ref_bodies(
+                bug_id=bug_id,
+                project=project,
+                pr_infos=pr_infos,
+            )
+
+        # --- Merge pass: registry order (backend first) ---------------
+        merged_prs: list[tuple[str, str, int]] = []
+        for repo_cfg, pr_info in pr_infos:
+            fresh = await _load_bug(bug_id)
+            if fresh is None or BugState(fresh["state"]) in TERMINAL_STATES:
+                logger.info(
+                    "merge_bug: bug_id=%s terminated mid-merge; stopping",
+                    bug_id,
+                )
+                return
             await _merge_one_pr(
                 bug_id=bug_id, repo_cfg=repo_cfg, pr_info=pr_info
             )
             merged_prs.append((repo_cfg.name, pr_info.url, pr_info.number))
 
     except GitHubError as exc:
-        logger.exception(
-            "merge_bug: gh failure for bug_id=%s repo=%s; BLOCKED",
-            bug_id,
-            repos_to_merge[len(merged_prs)].name if len(merged_prs) < len(repos_to_merge) else "?",
+        # Local for the except block — merged_prs is only bound inside
+        # the try when we get past the create + cross-ref edit passes.
+        merged_so_far: list[tuple[str, str, int]] = locals().get(
+            "merged_prs", []
         )
-        if merged_prs:
+        logger.exception(
+            "merge_bug: gh failure for bug_id=%s; merged_so_far=%s; BLOCKED",
+            bug_id,
+            [p[0] for p in merged_so_far],
+        )
+        if merged_so_far:
             # Cross-repo partial merge — preserve the merged PRs list in
-            # the failure section (Agent 10's concern, but the machinery
-            # is here so it Just Works).
+            # the failure section. The first merged PR (backend) cannot
+            # be auto-reverted; the operator handles the rollback.
             await _mark_partial_merge(
                 bug_id,
                 project=project,
-                merged_prs=merged_prs,
+                merged_prs=merged_so_far,
                 stderr_excerpt=str(exc),
             )
         else:
@@ -218,12 +267,16 @@ async def _ensure_pr_created(
     bug_id: int,
     repo_cfg: RepoConfig,
     project: ProjectConfig,
+    cross_ref_body_note: str | None = None,
 ) -> PRInfo:
     """Return an open PR for ``(bug_id, repo_cfg)``.
 
     Reuses an existing ``pull_requests`` row with status='open' if one
     exists; otherwise calls ``gh_pr_create`` with the bug's TRIAGE.md as
-    the PR body.
+    the PR body. ``cross_ref_body_note`` (Agent 10) appends a placeholder
+    cross-reference note at the BOTTOM of the body — the second-pass
+    :func:`_update_cross_ref_bodies` rewrites it with the actual URL of
+    the other repo's PR placed at the TOP.
     """
     existing = await _find_open_pr(bug_id, repo_cfg.name)
     if existing is not None:
@@ -259,6 +312,7 @@ async def _ensure_pr_created(
         bug_id=bug_id,
         title=title,
         body_path=body_path,
+        cross_ref_body_note=cross_ref_body_note,
     )
 
     # Persist the PR row so subsequent retries reuse it.
@@ -282,6 +336,48 @@ async def _merge_one_pr(
         worktree=worktree, pr_number=pr_info.number, squash=True, delete_branch=True
     )
     await _flip_pr_to_merged(bug_id=bug_id, pr_number=pr_info.number)
+
+
+async def _update_cross_ref_bodies(
+    *,
+    bug_id: int,
+    project: ProjectConfig,
+    pr_infos: list[tuple[RepoConfig, PRInfo]],
+) -> None:
+    """Rewrite each PR body with a top-placed cross-ref to the OTHER PR.
+
+    For two-repo cross-repo (the only cross-repo shape v1 supports), each
+    PR's body becomes::
+
+        > Related PR: <other_pr_url>
+
+        <original TRIAGE.md content>
+
+    For >2 repos (future), each PR points at the next PR in registry
+    order. Errors here propagate as :class:`GitHubError` so the caller's
+    partial-merge handling triggers correctly — we have NOT merged
+    anything yet at this point in the flow, so a cross-ref edit failure
+    lands in the regular ``_mark_merge_failure`` path.
+    """
+    if len(pr_infos) < 2:
+        return
+    # Map repo_name → other PR's URL. For 2-repo: the other entry. For
+    # 3+ repos: each PR points at the next one (registry order), so the
+    # cross-references form a cycle the operator can navigate.
+    other_url: dict[str, str] = {}
+    for idx, (repo_cfg, _pr_info) in enumerate(pr_infos):
+        other_idx = (idx + 1) % len(pr_infos)
+        other_url[repo_cfg.name] = pr_infos[other_idx][1].url
+
+    for repo_cfg, pr_info in pr_infos:
+        worktree = wt_module.path_for(bug_id, repo_cfg.name)
+        body_path = _resolve_triage_md_path(bug_id, project)
+        await github_module.gh_pr_edit_body(
+            worktree=worktree,
+            pr_number=pr_info.number,
+            body_path=body_path,
+            cross_ref_url=other_url[repo_cfg.name],
+        )
 
 
 # --- Internals: failure handling -------------------------------------------

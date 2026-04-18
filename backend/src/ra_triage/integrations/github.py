@@ -191,13 +191,27 @@ async def gh_pr_create(
     title: str,
     body_path: Path,
     cross_ref_body_note: str | None = None,
+    cross_ref_url: str | None = None,
 ) -> PRInfo:
     """Create a pull request from ``triage/<bug_id>`` to ``repo.main_branch``.
 
     Runs ``git push -u origin <branch>`` before ``gh pr create`` so the
     branch exists on the remote. When ``cross_ref_body_note`` is provided
-    (Agent 10's cross-repo case) we concatenate ``body_path``'s contents
-    with the note into a temp file and pass that to ``gh`` via ``--body-file``.
+    (Agent 10's cross-repo case, first pass) we concatenate ``body_path``'s
+    contents with the note into a temp file and pass that to ``gh`` via
+    ``--body-file``.
+
+    When ``cross_ref_url`` is provided (Agent 10 second-pass or single-pass
+    when the other-side URL is already known) we PREPEND a single
+    cross-reference line to the PR body so the link appears at the top of
+    the description for easy discovery:
+
+        > Related PR: <cross_ref_url>
+
+    ``cross_ref_url`` takes precedence over ``cross_ref_body_note`` when
+    both are supplied; they are not expected to be used together but the
+    former's top-placement is the specced behavior for the cross-repo flow
+    (merge.py's two-pass edit relies on ``gh_pr_edit_body`` below).
 
     Returns a :class:`PRInfo` with ``status='open'`` on success. Raises
     :class:`GitHubError` on any failure; the caller turns that into a
@@ -216,12 +230,24 @@ async def gh_pr_create(
     # fail with "must first push the current branch to a remote".
     await _git_push(worktree=worktree, branch=branch)
 
-    # Assemble the body file. If there's a cross-ref note, copy body_path's
-    # contents + the note into a temp file and point --body-file at it. We
+    # Assemble the body file. If there's a cross-ref URL (top-placement) or
+    # a cross-ref note (bottom-placement), copy body_path's contents + the
+    # decoration into a temp file and point --body-file at it. We
     # deliberately don't mutate the original TRIAGE.md.
     effective_body_path = body_path
     temp_body: Path | None = None
-    if cross_ref_body_note is not None and cross_ref_body_note.strip():
+    if cross_ref_url is not None and cross_ref_url.strip():
+        original = body_path.read_text(encoding="utf-8")
+        temp_body = Path(
+            tempfile.mkstemp(prefix=f"triage-pr-body-{bug_id}-", suffix=".md")[1]
+        )
+        header = f"> Related PR: {cross_ref_url.strip()}\n\n"
+        temp_body.write_text(
+            header + original.rstrip("\n") + "\n",
+            encoding="utf-8",
+        )
+        effective_body_path = temp_body
+    elif cross_ref_body_note is not None and cross_ref_body_note.strip():
         original = body_path.read_text(encoding="utf-8")
         temp_body = Path(
             tempfile.mkstemp(prefix=f"triage-pr-body-{bug_id}-", suffix=".md")[1]
@@ -300,6 +326,74 @@ async def gh_pr_merge(
         )
 
 
+async def gh_pr_edit_body(
+    *,
+    worktree: Path,
+    pr_number: int,
+    body_path: Path,
+    cross_ref_url: str | None = None,
+) -> None:
+    """Update an existing PR's body via ``gh pr edit --body-file``.
+
+    Used by the cross-repo merge flow: both PRs are created first (each
+    referencing "related PR will be linked here"), then this helper runs
+    on each PR with the OTHER PR's URL so both bodies end up with a
+    top-placed cross-reference line::
+
+        > Related PR: <cross_ref_url>
+
+        <original TRIAGE.md body>
+
+    ``body_path`` must exist; ``cross_ref_url`` is optional — when absent,
+    the PR body is rewritten verbatim from ``body_path``. Raises
+    :class:`GitHubError` on failure.
+    """
+    _resolve_gh()
+    if not body_path.exists():
+        raise GitHubError(
+            f"PR body file {body_path} does not exist — cannot edit PR #{pr_number}."
+        )
+
+    # Build the effective body file (either a decorated temp file, or the
+    # original if no URL). Temp file is cleaned up after gh finishes.
+    temp_body: Path | None = None
+    effective_body_path = body_path
+    if cross_ref_url is not None and cross_ref_url.strip():
+        original = body_path.read_text(encoding="utf-8")
+        temp_body = Path(
+            tempfile.mkstemp(
+                prefix=f"triage-pr-edit-{pr_number}-", suffix=".md"
+            )[1]
+        )
+        header = f"> Related PR: {cross_ref_url.strip()}\n\n"
+        temp_body.write_text(
+            header + original.rstrip("\n") + "\n",
+            encoding="utf-8",
+        )
+        effective_body_path = temp_body
+
+    try:
+        argv = [
+            "gh",
+            "pr",
+            "edit",
+            str(pr_number),
+            "--body-file",
+            str(effective_body_path),
+        ]
+        result = await _runner(argv, cwd=worktree, timeout=_GH_TIMEOUT_SECONDS)
+    finally:
+        if temp_body is not None:
+            with contextlib.suppress(OSError):
+                temp_body.unlink()
+
+    if result.returncode != 0:
+        raise GitHubError(
+            f"`gh pr edit {pr_number}` failed in {worktree} "
+            f"(exit {result.returncode}). stderr: {result.stderr.strip()}"
+        )
+
+
 async def gh_pr_status(
     *, worktree: Path, pr_number: int
 ) -> PRStatus:
@@ -372,6 +466,7 @@ __all__ = [
     "PRInfo",
     "PRStatus",
     "gh_pr_create",
+    "gh_pr_edit_body",
     "gh_pr_merge",
     "gh_pr_status",
     "set_runner",

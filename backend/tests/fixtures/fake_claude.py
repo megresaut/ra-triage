@@ -38,6 +38,28 @@ Behavior is scenario-driven via the ``FAKE_CLAUDE_SCENARIO`` env var:
     post-run safety check. Appends ``## Tester Notes`` and prints
     ``TESTER_COMPLETE``.
 
+  Cross-repo scenarios (Agent 10):
+  - ``designer_complete``: appends a minimal valid ``## Cross-Repo Contract``
+    body to TRIAGE.md; prints ``FIX_DESIGNER_COMPLETE``.
+  - ``designer_failed``: appends ``## Fix Designer Failure`` and prints
+    ``FIX_DESIGNER_FAILED``.
+  - ``fixer_fe_complete`` / ``fixer_be_complete``: each appends
+    ``## Fixer-Frontend Notes`` / ``## Fixer-Backend Notes`` with stub
+    bodies; prints the side-specific COMPLETE token.
+  - ``fixer_fe_contract_concern`` / ``fixer_be_contract_concern``: each
+    appends the Notes section PLUS a ``## Fixer-<Side> Contract Concern``
+    section, and still prints the COMPLETE token. (The real prompt says
+    "flag a mismatch... and stopping" — we interpret "stopping" as
+    reporting the concern while still finishing cleanly, because the
+    orchestrator uses the concern section to route the pipeline back to
+    DESIGNING. Documented in Agent 10's completion report.)
+  - ``fixer_fe_failed`` / ``fixer_be_failed``: each appends
+    ``## Fixer-<Side> Failure`` and prints the side-specific FAILED token.
+  - ``integration_complete``: appends ``## Integration Tester Notes`` and
+    prints ``INTEGRATION_TESTER_COMPLETE``.
+  - ``integration_failed``: appends ``## Integration Tester Failure`` and
+    prints ``INTEGRATION_TESTER_FAILED``.
+
 The subprocess writes TRIAGE.md into ``os.getcwd()`` (which equals the
 worktree path the base class passes in as ``cwd``). That exercises the
 contract that the agent writes into the worktree, not the prompts dir.
@@ -230,6 +252,97 @@ def write_triage_md(scenario: str, cwd: Path) -> None:
             "- Also edited src/handler.go (should be reverted by orchestrator)\n",
         )
 
+    # ---- Cross-repo scenarios (Agent 10) -----------------------------
+    elif scenario == "designer_complete":
+        _append_section(
+            path,
+            "Cross-Repo Contract",
+            "### Shared Data Shape\n"
+            "user: { id: string, name: string, email: string }\n\n"
+            "### Backend Responsibilities\n"
+            "- GET /users/:id returns 200 with `user` or 404\n\n"
+            "### Frontend Responsibilities\n"
+            "- On 404 render empty state; on 200 render the user card\n\n"
+            "### Shared Assumptions\n"
+            "- id is a UUID; email is never null.\n\n"
+            "### Integration Test Scenario\n"
+            "1. Create a user via POST; 2. GET /users/:id from FE; 3. Assert card renders.\n",
+        )
+    elif scenario == "designer_failed":
+        _append_section(
+            path,
+            "Fix Designer Failure",
+            "- Diagnosis: insufficient context in TRIAGE.md to author a contract.\n",
+        )
+    elif scenario == "fixer_fe_complete":
+        _append_section(
+            path,
+            "Fixer-Frontend Notes",
+            "- Files changed: src/UserCard.tsx\n"
+            "- Key decisions: render empty state on 404\n"
+            "- Any contract-mismatch concerns: none\n",
+        )
+    elif scenario == "fixer_be_complete":
+        _append_section(
+            path,
+            "Fixer-Backend Notes",
+            "- Files changed: api/handlers/user.go\n"
+            "- Key decisions: return 404 on missing user\n"
+            "- Any contract-mismatch concerns: none\n",
+        )
+    elif scenario == "fixer_fe_contract_concern":
+        _append_section(
+            path,
+            "Fixer-Frontend Notes",
+            "- Files changed: (none — stopping on contract concern)\n"
+            "- Any contract-mismatch concerns: see ## Fixer-Frontend Contract Concern\n",
+        )
+        _append_section(
+            path,
+            "Fixer-Frontend Contract Concern",
+            "- The contract says `user.email` is non-null but the FE "
+            "spec expects it optional in the profile card view.\n",
+        )
+    elif scenario == "fixer_be_contract_concern":
+        _append_section(
+            path,
+            "Fixer-Backend Notes",
+            "- Files changed: (none — stopping on contract concern)\n"
+            "- Any contract-mismatch concerns: see ## Fixer-Backend Contract Concern\n",
+        )
+        _append_section(
+            path,
+            "Fixer-Backend Contract Concern",
+            "- The contract says GET /users/:id returns 404 on missing, "
+            "but the legacy client expects 200 with empty body.\n",
+        )
+    elif scenario == "fixer_fe_failed":
+        _append_section(
+            path,
+            "Fixer-Frontend Failure",
+            "- Diagnosis: tsc errors in components I can't resolve.\n",
+        )
+    elif scenario == "fixer_be_failed":
+        _append_section(
+            path,
+            "Fixer-Backend Failure",
+            "- Diagnosis: go vet surfaced an error I can't resolve.\n",
+        )
+    elif scenario == "integration_complete":
+        _append_section(
+            path,
+            "Integration Tester Notes",
+            "- Scenario result: all 3 steps passed\n"
+            "- Integration test file: tests/integration/user_test.go\n"
+            "- Any behavioral deltas vs. contract: none\n",
+        )
+    elif scenario == "integration_failed":
+        _append_section(
+            path,
+            "Integration Tester Failure",
+            "- Diagnosis: FE rendered empty state but BE returned 500.\n",
+        )
+
 
 def main() -> int:
     scenario = SCENARIO
@@ -271,6 +384,19 @@ def main() -> int:
         "tester_complete": "TESTER_COMPLETE",
         "tester_failed": "TESTER_FAILED",
         "tester_writes_prod_code": "TESTER_COMPLETE",
+        # Cross-repo scenarios (Agent 10). Contract-concern scenarios
+        # still emit COMPLETE tokens — the concern is surfaced via the
+        # TRIAGE.md section, not the token (see module docstring).
+        "designer_complete": "FIX_DESIGNER_COMPLETE",
+        "designer_failed": "FIX_DESIGNER_FAILED",
+        "fixer_fe_complete": "FIXER_FRONTEND_COMPLETE",
+        "fixer_fe_contract_concern": "FIXER_FRONTEND_COMPLETE",
+        "fixer_fe_failed": "FIXER_FRONTEND_FAILED",
+        "fixer_be_complete": "FIXER_BACKEND_COMPLETE",
+        "fixer_be_contract_concern": "FIXER_BACKEND_COMPLETE",
+        "fixer_be_failed": "FIXER_BACKEND_FAILED",
+        "integration_complete": "INTEGRATION_TESTER_COMPLETE",
+        "integration_failed": "INTEGRATION_TESTER_FAILED",
     }
     token = token_by_scenario.get(scenario, "INVESTIGATOR_COMPLETE")
     if token is not None:

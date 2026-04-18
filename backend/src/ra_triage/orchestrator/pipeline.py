@@ -54,6 +54,7 @@ from ra_triage.db import engine as engine_module
 from ra_triage.db import repo as repo_module
 from ra_triage.db.models import AgentRun, Bug
 from ra_triage.orchestrator import concurrency, tester_safety
+from ra_triage.orchestrator.shutdown import shutdown as shutdown_flag
 from ra_triage.orchestrator.states import (
     TERMINAL_STATES,
     BugState,
@@ -88,6 +89,12 @@ async def run_pipeline(bug_id: int) -> None:
 
 async def _run_pipeline_body(bug_id: int) -> None:
     """Pipeline body — runs with the semaphore held."""
+    if shutdown_flag.is_shutting_down():
+        logger.info(
+            "run_pipeline: shutdown in progress; refusing new admission for bug_id=%s",
+            bug_id,
+        )
+        return
     bug_snapshot = await _load_bug(bug_id)
     if bug_snapshot is None:
         logger.warning("run_pipeline: bug_id=%s not found; aborting", bug_id)
@@ -1136,8 +1143,22 @@ async def _run_cross_repo_design_fix_test(
         # Determine designer_concerns input for this cycle. On the first
         # cycle this is None; on the re-design cycle it's whatever
         # combined contract concerns / integration failure context the
-        # previous iteration accumulated (cached via the closure below).
+        # previous iteration accumulated.
+        #
+        # Agent 12: the in-memory ``_designer_concerns_holder`` dict does
+        # not survive backend restart. To make restart-resume correct
+        # (Agent 12 brief §2), we re-derive concerns from TRIAGE.md on
+        # every read: if the holder is empty but TRIAGE.md contains
+        # ``## Fixer-<Side> Contract Concern`` sections OR an unresolved
+        # ``## Integration Tester Failure`` section, we reconstruct the
+        # concern blob on the fly. TRIAGE.md is already the source of
+        # truth, so this is a no-op on the forward path and a correct
+        # restart recovery on the resume path.
         designer_concerns = _designer_concerns_holder.get(bug_id)
+        if designer_concerns is None:
+            designer_concerns = _reconstruct_designer_concerns_from_triage(
+                triage_md_path
+            )
 
         designer_result = await _run_fix_designer(
             bug_id=bug_id,
@@ -1413,6 +1434,48 @@ def _format_designer_concerns(*, fe_concern: str, be_concern: str) -> str:
     return "\n\n".join(parts)
 
 
+def _reconstruct_designer_concerns_from_triage(
+    triage_md_path: Path,
+) -> str | None:
+    """Rebuild the designer-concerns prompt block from TRIAGE.md.
+
+    Agent 12: the in-memory ``_designer_concerns_holder`` is volatile.
+    On backend restart mid-cross-repo cycle, the holder is empty but
+    TRIAGE.md still has the sections that drove the previous iteration's
+    re-design. We re-derive the concerns blob the same way the live
+    pipeline would, then return it (or ``None`` if there's nothing to
+    reconstruct).
+
+    Sources, in order of preference:
+      - ``## Fixer-Frontend Contract Concern`` and/or
+        ``## Fixer-Backend Contract Concern`` — fed via
+        :func:`_format_designer_concerns`.
+      - ``## Integration Tester Failure`` — fed as the integration-failure
+        concern (matching the live pipeline's else-branch).
+
+    Returns ``None`` when neither source is present (a fresh first
+    cycle); otherwise a non-empty string ready for the Designer prompt.
+    """
+    if not triage_md_path.exists():
+        return None
+    sections = triage_parser.parse(triage_md_path)
+    fe_concern = sections.get("Fixer-Frontend Contract Concern", "").strip()
+    be_concern = sections.get("Fixer-Backend Contract Concern", "").strip()
+    if fe_concern or be_concern:
+        return _format_designer_concerns(
+            fe_concern=fe_concern, be_concern=be_concern
+        )
+    integration_failure = sections.get(
+        "Integration Tester Failure", ""
+    ).strip()
+    if integration_failure:
+        return (
+            "Integration Tester reported failure on the prior cycle:\n"
+            + integration_failure
+        )
+    return None
+
+
 def _has_section(sections: dict[str, str], name: str) -> bool:
     return bool(sections.get(name, "").strip())
 
@@ -1589,7 +1652,21 @@ async def _transition(bug_id: int, new_state: BugState) -> None:
     already been cancelled or is otherwise in a state that can't reach
     ``new_state``, we log and return. This matches the "respect cancel"
     requirement from Agent 5's brief.
+
+    Agent 12: also short-circuits cleanly when
+    :data:`orchestrator.shutdown.shutdown` has been triggered. We log
+    once and bail without writing — the bug stays in its current state
+    so the next boot's :func:`orchestrator.resume.resume_inflight`
+    re-enters at the right step.
     """
+    if shutdown_flag.is_shutting_down():
+        logger.info(
+            "transition: shutdown in progress; bug_id=%s left in current state "
+            "(target was %s) — resume will pick up next boot",
+            bug_id,
+            new_state.value,
+        )
+        return
     await asyncio.to_thread(_transition_sync, bug_id, new_state)
 
 
@@ -2226,11 +2303,229 @@ async def _retry_last_agent_body(bug_id: int) -> None:
         await _transition(bug_id, BugState.BLOCKED)
         return
 
-    # Cross-repo roles land here until Agent 10 ships.
+    # --- Cross-repo retry paths (Agent 12) -----------------------------
+    # Each cross-repo role re-runs ONLY its own agent, with attempt
+    # incremented for that role only. The pipeline does not auto-advance
+    # past the retried step — operators inspect TRIAGE.md and either
+    # press the standard Retry again or click Confirm/Cancel as the
+    # next action. This matches single-repo retry semantics (Fixer
+    # success advances to TESTING, but a second Fixer failure stays in
+    # BLOCKED rather than auto-bouncing).
+
+    if role == "fix_designer":
+        # Re-run the Designer with whatever current contract concerns
+        # TRIAGE.md exposes (re-derived for restart-resume).
+        await _transition_for_retry(bug_id, BugState.DESIGNING)
+        be_repo = _pick_repo_by_role(project, "backend")
+        if be_repo is None:
+            await _transition(bug_id, BugState.BLOCKED)
+            return
+        be_worktree = worktrees.get(be_repo.name) or wt_module.path_for(
+            bug_id, be_repo.name
+        )
+        designer_concerns = _designer_concerns_holder.get(bug_id)
+        if designer_concerns is None:
+            designer_concerns = _reconstruct_designer_concerns_from_triage(
+                triage_md_path
+            )
+        designer_result = await _run_fix_designer(
+            bug_id=bug_id,
+            project=project,
+            be_worktree=be_worktree,
+            triage_md_path=triage_md_path,
+            designer_concerns=designer_concerns,
+        )
+        sections_after = triage_parser.parse(triage_md_path)
+        contract_present = bool(
+            sections_after.get("Cross-Repo Contract", "").strip()
+        )
+        if (
+            designer_result.completion_token == "FIX_DESIGNER_COMPLETE"
+            and contract_present
+        ):
+            # Designer succeeded — advance to FIXING_PARALLEL so the
+            # next user action (or a follow-up retry) re-engages the
+            # Fixers. We don't auto-spawn the Fixers here because
+            # retry semantics are "re-run THIS step only".
+            await _transition(bug_id, BugState.FIXING_PARALLEL)
+            return
+        await _transition(bug_id, BugState.BLOCKED)
+        return
+
+    if role in ("fixer_frontend", "fixer_backend"):
+        # Re-run ONLY the side that failed. Increment attempt for that
+        # side only — the OTHER side's attempt counter is untouched
+        # (verified by the cross-repo retry test).
+        await _transition_for_retry(bug_id, BugState.FIXING_PARALLEL)
+        be_repo = _pick_repo_by_role(project, "backend")
+        fe_repo = _pick_repo_by_role(project, "frontend")
+        if be_repo is None or fe_repo is None:
+            await _transition(bug_id, BugState.BLOCKED)
+            return
+        be_worktree = worktrees.get(be_repo.name) or wt_module.path_for(
+            bug_id, be_repo.name
+        )
+        fe_worktree = worktrees.get(fe_repo.name) or wt_module.path_for(
+            bug_id, fe_repo.name
+        )
+        single_result = await _run_single_fixer_side(
+            bug_id=bug_id,
+            project=project,
+            role=role,
+            fe_repo=fe_repo,
+            be_repo=be_repo,
+            fe_worktree=fe_worktree,
+            be_worktree=be_worktree,
+            triage_md_path=triage_md_path,
+        )
+        expected_token = (
+            "FIXER_FRONTEND_COMPLETE"
+            if role == "fixer_frontend"
+            else "FIXER_BACKEND_COMPLETE"
+        )
+        if single_result.completion_token == expected_token:
+            # The OTHER side may still be in a failed state — leave
+            # the bug in FIXING_PARALLEL so the operator can either
+            # retry the other side or take over.
+            return
+        await _transition(bug_id, BugState.BLOCKED)
+        return
+
+    if role == "integration_tester":
+        # Re-run only the Integration Tester. State-wise, BLOCKED
+        # → INTEGRATION_TESTING isn't a legal direct transition, so we
+        # walk via FIXING_PARALLEL (legal: BLOCKED → FIXING_PARALLEL,
+        # FIXING_PARALLEL → INTEGRATION_TESTING).
+        bug_snap = await _load_bug(bug_id)
+        if bug_snap is None or _is_terminal(bug_snap["state"]):
+            return
+        current = BugState(bug_snap["state"])
+        if current == BugState.BLOCKED:
+            await _transition(bug_id, BugState.FIXING_PARALLEL)
+            await _transition(bug_id, BugState.INTEGRATION_TESTING)
+        elif current == BugState.FIXING_PARALLEL:
+            await _transition(bug_id, BugState.INTEGRATION_TESTING)
+        # Already INTEGRATION_TESTING is a no-op for the transition.
+
+        be_repo = _pick_repo_by_role(project, "backend")
+        fe_repo = _pick_repo_by_role(project, "frontend")
+        if be_repo is None or fe_repo is None:
+            await _transition(bug_id, BugState.BLOCKED)
+            return
+        be_worktree = worktrees.get(be_repo.name) or wt_module.path_for(
+            bug_id, be_repo.name
+        )
+        fe_worktree = worktrees.get(fe_repo.name) or wt_module.path_for(
+            bug_id, fe_repo.name
+        )
+        integration_result = await _run_integration_tester(
+            bug_id=bug_id,
+            project=project,
+            be_repo=be_repo,
+            fe_repo=fe_repo,
+            be_worktree=be_worktree,
+            fe_worktree=fe_worktree,
+            triage_md_path=triage_md_path,
+        )
+        await _pkill_integration_ports(
+            be_port=be_repo.integration_port,
+            fe_port=fe_repo.integration_port,
+        )
+        if (
+            integration_result.completion_token
+            == "INTEGRATION_TESTER_COMPLETE"
+        ):
+            await _transition(bug_id, BugState.READY_FOR_REVIEW)
+            return
+        await _transition(bug_id, BugState.BLOCKED)
+        return
+
     raise ValueError(
-        f"retry for agent role {role!r} is not yet implemented "
-        "(Agent 10 fills cross-repo)"
+        f"retry for agent role {role!r} is not implemented"
     )
+
+
+async def _run_single_fixer_side(
+    *,
+    bug_id: int,
+    project: ProjectConfig,
+    role: str,
+    fe_repo: RepoConfig,
+    be_repo: RepoConfig,
+    fe_worktree: Path,
+    be_worktree: Path,
+    triage_md_path: Path,
+) -> AgentResult:
+    """Re-run ONE side of the cross-repo fixer pair (Agent 12 retry).
+
+    Used by :func:`retry_last_agent` when the operator clicks Retry on
+    a bug whose latest agent_run is ``fixer_frontend`` or ``fixer_backend``.
+    Re-runs only that side; the other side's attempt counter is untouched
+    (each side's attempt is computed independently via
+    :func:`_next_attempt`).
+
+    The implementation mirrors :func:`_run_fixers_in_parallel` but
+    spawns exactly one Fixer.
+    """
+    if role == "fixer_frontend":
+        repo_cfg = fe_repo
+        worktree = fe_worktree
+        fixer_cls: Any = FixerFrontend
+        side = "Frontend"
+    else:  # fixer_backend
+        repo_cfg = be_repo
+        worktree = be_worktree
+        fixer_cls = FixerBackend
+        side = "Backend"
+
+    attempt = await _next_attempt(bug_id, role=role)
+    started_at = _utcnow()
+    run_id = await _insert_agent_run_start(
+        bug_id=bug_id,
+        role=role,
+        attempt=attempt,
+        started_at=started_at,
+        log_path=_predicted_log_path(bug_id, role, attempt),
+        prompt_path=_predicted_prompt_path(bug_id, role, attempt),
+        worktree_repo=repo_cfg.name,
+    )
+
+    bug = await _load_bug_row(bug_id)
+    if bug is None:
+        raise RuntimeError(f"Bug {bug_id} vanished mid-pipeline")
+
+    context: dict[str, Any] = {
+        "bug": {"id": bug["id"], "title": bug["title"]},
+        "side": side,
+        "worktree_path": str(worktree),
+        "build_command": repo_cfg.build_command,
+        "deny_list": {
+            "paths": list(project.deny_list.paths),
+            "categories": list(project.deny_list.categories),
+        },
+        "triage_md_path": str(triage_md_path),
+        "escalation_context": None,
+        "conflict_context": None,
+        "attempt": attempt,
+    }
+
+    fixer = fixer_cls()
+    result = await fixer.run(
+        bug=_BugView(**bug),
+        worktree=worktree,
+        context=context,
+    )
+
+    await _finalize_agent_run(
+        run_id=run_id,
+        ended_at=result.ended_at,
+        exit_code=result.exit_code,
+        completion_token=result.completion_token,
+        log_path=result.log_path,
+        prompt_path=result.prompt_path,
+        triage_md_snapshot=result.triage_md,
+    )
+    return result
 
 
 #: States from which :func:`retry_last_agent` will accept a retry request.

@@ -370,6 +370,7 @@ async def _run_single_repo_fix_and_test(
     scope: dict[str, Any],
     triage_md_path: Path,
     escalation_context: str | None = None,
+    conflict_context: str | None = None,
 ) -> None:
     """Drive INVESTIGATING → FIXING → TESTING → READY_FOR_REVIEW (or BLOCKED).
 
@@ -431,6 +432,7 @@ async def _run_single_repo_fix_and_test(
         worktree=worktree,
         triage_md_path=triage_md_path,
         escalation_context=escalation_context,
+        conflict_context=conflict_context,
     )
 
     # Post-Fixer routing. We check both the completion token and the
@@ -544,6 +546,7 @@ async def _run_fixer(
     worktree: Path,
     triage_md_path: Path,
     escalation_context: str | None = None,
+    conflict_context: str | None = None,
 ) -> AgentResult:
     """Spawn the Fixer, record its agent_runs row, return the result.
 
@@ -551,6 +554,11 @@ async def _run_fixer(
     template's ``{% if escalation_context %}`` block when the caller is
     the approve / pick-alternative flow (Agent 9). Forward-path runs
     leave it ``None``.
+
+    ``conflict_context`` (Agent 11) is threaded into the Fixer prompt
+    template's ``{% if conflict_context %}`` block when the caller is
+    the retry-fixer-with-conflict flow. Forward-path runs leave it
+    ``None``.
     """
     attempt = await _next_attempt(bug_id, role="fixer")
     started_at = _utcnow()
@@ -586,6 +594,10 @@ async def _run_fixer(
         # flow. Forward-path runs pass None; the Fixer prompt's
         # ``{% if escalation_context %}`` block degrades cleanly.
         "escalation_context": escalation_context,
+        # Agent 11 sets ``conflict_context`` via the retry-with-conflict
+        # flow. Forward-path runs pass None; the Fixer prompt's
+        # ``{% if conflict_context %}`` block degrades cleanly.
+        "conflict_context": conflict_context,
         "attempt": attempt,
     }
 
@@ -751,6 +763,7 @@ async def _run_fixers_in_parallel(
     be_worktree: Path,
     triage_md_path: Path,
     escalation_context: str | None = None,
+    conflict_context: str | None = None,
 ) -> tuple[AgentResult, AgentResult]:
     """Spawn FixerFrontend + FixerBackend concurrently via ``asyncio.gather``.
 
@@ -804,6 +817,7 @@ async def _run_fixers_in_parallel(
         },
         "triage_md_path": str(triage_md_path),
         "escalation_context": escalation_context,
+        "conflict_context": conflict_context,
         "attempt": fe_attempt,
     }
     be_context: dict[str, Any] = {
@@ -817,6 +831,7 @@ async def _run_fixers_in_parallel(
         },
         "triage_md_path": str(triage_md_path),
         "escalation_context": escalation_context,
+        "conflict_context": conflict_context,
         "attempt": be_attempt,
     }
 
@@ -1019,6 +1034,7 @@ async def _run_cross_repo_design_fix_test(
     triage_md_path: Path,
     worktrees: dict[str, Path] | None = None,
     escalation_context: str | None = None,
+    conflict_context: str | None = None,
 ) -> None:
     """Drive INVESTIGATING → DESIGNING → FIXING_PARALLEL → INTEGRATION_TESTING → READY_FOR_REVIEW.
 
@@ -1205,6 +1221,7 @@ async def _run_cross_repo_design_fix_test(
             be_worktree=be_worktree,
             triage_md_path=triage_md_path,
             escalation_context=escalation_context,
+            conflict_context=conflict_context,
         )
 
         # Fail-fast on either fixer FAILED / crashed.
@@ -2435,8 +2452,271 @@ async def _run_with_escalation_context_body(
     )
 
 
+# --- Agent 11: Retry Fixer with conflict as context ---------------------
+
+
+async def retry_fixer_with_conflict(bug_id: int) -> None:
+    """Re-run the Fixer against a BLOCKED-with-conflict bug.
+
+    Contract (Agent 11):
+      - Caller (``POST /bugs/:id/retry-fixer-with-conflict`` handler) has
+        verified the bug is in ``BLOCKED`` with a non-null
+        ``conflict_files`` column.
+      - This coroutine loads the conflict file list + the diff snapshot
+        (via :func:`workspaces.rebase.fetch_conflict_diff`), assembles a
+        ``conflict_context`` prose block, transitions the bug BLOCKED →
+        FIXING (single-repo) or BLOCKED → FIXING_PARALLEL (cross-repo),
+        clears the ``bugs.conflict_files`` denorm, then re-enters the
+        standard Fixer → Tester / Design → Fixers → Integration Tester
+        flow with ``conflict_context`` threaded into the Fixer prompt(s).
+      - Never raises: exceptions are caught + logged (as with
+        :func:`run_pipeline`).
+
+    Why we clear ``conflict_files`` at entry rather than waiting for the
+    Fixer to succeed: once the reviewer has clicked "Retry Fixer with
+    conflict as context", the bug is no longer blocked on that
+    particular conflict — we're re-engaging. If the Fixer fails again
+    and re-blocks the bug, a NEW rebase attempt (triggered by the next
+    merge) will re-stamp ``conflict_files``.
+    """
+    async with concurrency.PIPELINE_SEMAPHORE:
+        try:
+            await _retry_fixer_with_conflict_body(bug_id)
+        except Exception:
+            logger.exception(
+                "retry_fixer_with_conflict crashed for bug_id=%s", bug_id
+            )
+
+
+async def _retry_fixer_with_conflict_body(bug_id: int) -> None:
+    bug_snapshot = await _load_bug(bug_id)
+    if bug_snapshot is None:
+        logger.warning(
+            "retry_fixer_with_conflict: bug_id=%s not found; aborting", bug_id
+        )
+        return
+    if _is_terminal(bug_snapshot["state"]):
+        logger.info(
+            "retry_fixer_with_conflict: bug_id=%s terminal; aborting", bug_id
+        )
+        return
+    if bug_snapshot["state"] != BugState.BLOCKED.value:
+        logger.warning(
+            "retry_fixer_with_conflict: bug %d not BLOCKED (state=%s); aborting",
+            bug_id,
+            bug_snapshot["state"],
+        )
+        return
+
+    # Pull the conflict file list + pre-aborted diff snapshot.
+    conflict_files = await asyncio.to_thread(_load_conflict_files_sync, bug_id)
+    if not conflict_files:
+        logger.warning(
+            "retry_fixer_with_conflict: bug %d has no conflict_files; aborting",
+            bug_id,
+        )
+        return
+
+    project = get_project(bug_snapshot["project_id"])
+    affected_names = repo_module.parse_affected_repos(
+        bug_snapshot.get("affected_repos")
+    )
+    # Pick the repo that conflicted — in practice conflict lives on a
+    # single repo (the rebase sweep records per-repo), but the bug may
+    # be cross-repo overall. We resolve the conflict repo from the most
+    # recent ``rebase_attempts`` row; fall back to the project's backend
+    # repo if the row disappeared.
+    conflict_repo_name = await asyncio.to_thread(
+        _latest_conflict_repo_sync, bug_id
+    )
+    if conflict_repo_name is None:
+        # Fallback: first affected repo.
+        conflict_repo_name = affected_names[0] if affected_names else None
+    if conflict_repo_name is None:
+        logger.warning(
+            "retry_fixer_with_conflict: could not resolve conflict repo for bug %d",
+            bug_id,
+        )
+        return
+
+    diff_snippet = ""
+    try:
+        from ra_triage.workspaces import rebase as rebase_module
+
+        diff_snippet = await rebase_module.fetch_conflict_diff(
+            bug_id=bug_id,
+            repo_name=conflict_repo_name,
+            project=project,
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "retry_fixer_with_conflict: fetch_conflict_diff failed for bug=%d repo=%s",
+            bug_id,
+            conflict_repo_name,
+        )
+
+    conflict_context = _format_conflict_context(
+        repo_name=conflict_repo_name,
+        conflict_files=conflict_files,
+        diff_snippet=diff_snippet,
+    )
+
+    # Decide single vs cross-repo based on ``bugs.scope`` (preferred) or
+    # the number of affected_repos. Cross-repo needs FIXING_PARALLEL;
+    # single-repo needs FIXING.
+    scope = bug_snapshot.get("scope") or ""
+    is_cross_repo = scope == "cross-repo" or len(affected_names) > 1
+
+    target_state = (
+        BugState.FIXING_PARALLEL if is_cross_repo else BugState.FIXING
+    )
+    await _transition(bug_id, target_state)
+    # Clear the denorm column AFTER the transition so event subscribers
+    # seeing the state_change event fetch a fresh bug without the stale
+    # conflict_files. The transition itself published the event; we do a
+    # second publish by re-transitioning is unnecessary — the frontend
+    # will refetch on the state change.
+    await asyncio.to_thread(_clear_conflict_files_sync, bug_id)
+
+    # Re-load the bug post-transition so downstream helpers see the
+    # right state.
+    post_snapshot = await _load_bug(bug_id)
+    if post_snapshot is None or _is_terminal(post_snapshot["state"]):
+        return
+    if BugState(post_snapshot["state"]) != target_state:
+        logger.warning(
+            "retry_fixer_with_conflict: bug %d did not reach %s (state=%s); aborting",
+            bug_id,
+            target_state.value,
+            post_snapshot["state"],
+        )
+        return
+
+    # Resolve worktrees — may need to recreate if the bug was cleaned
+    # up mid-flight. Rebase scenarios keep the worktree on disk so
+    # list_worktrees should work.
+    worktrees = wt_module.list_worktrees(bug_id)
+    if not worktrees:
+        try:
+            worktrees = await wt_module.create_worktrees_for_bug(
+                bug_id, project.repos
+            )
+        except wt_module.WorktreeError as exc:
+            await _block_with_escalation(
+                bug_id,
+                project=project,
+                reason_title="Worktree recreate failed during conflict retry",
+                reason_body=str(exc),
+            )
+            return
+
+    triage_md_path = _triage_md_worktree(project, worktrees) / "TRIAGE.md"
+
+    if is_cross_repo:
+        await _run_cross_repo_design_fix_test(
+            bug_id=bug_id,
+            project=project,
+            triage_md_path=triage_md_path,
+            worktrees=worktrees,
+            conflict_context=conflict_context,
+        )
+        return
+
+    # Single-repo: we need the scope dict for _run_single_repo_fix_and_test.
+    sections = triage_parser.parse(triage_md_path)
+    scope_dict = triage_parser.get_scope(sections)
+    # If the Investigator's Scope section somehow lost the affected repo
+    # (e.g. a really old run), reconstruct it so the Fixer picks correctly.
+    if not scope_dict.get("affected_repos"):
+        scope_dict["affected_repos"] = (
+            affected_names or [conflict_repo_name]
+        )
+        scope_dict.setdefault("scope", "single-repo")
+    await _run_single_repo_fix_and_test(
+        bug_id=bug_id,
+        project=project,
+        scope=scope_dict,
+        triage_md_path=triage_md_path,
+        conflict_context=conflict_context,
+    )
+
+
+def _format_conflict_context(
+    *,
+    repo_name: str,
+    conflict_files: list[str],
+    diff_snippet: str,
+) -> str:
+    """Assemble the prose block threaded into the Fixer prompt."""
+    lines = [
+        f"Repo: {repo_name}",
+        "Conflicting files:",
+    ]
+    for p in conflict_files:
+        lines.append(f"  - {p}")
+    if diff_snippet.strip():
+        lines.extend(
+            [
+                "",
+                "Diff vs origin/main (triple-dot; changes on this bug's branch since divergence):",
+                "",
+                "```diff",
+                diff_snippet.rstrip(),
+                "```",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "(No diff snapshot available — inspect the worktree directly.)",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _load_conflict_files_sync(bug_id: int) -> list[str] | None:
+    session = engine_module.SessionLocal()
+    try:
+        bug = repo_module.get_bug(session, bug_id)
+        if bug is None:
+            return None
+        return repo_module.parse_conflict_files(bug.conflict_files)
+    finally:
+        session.close()
+
+
+def _latest_conflict_repo_sync(bug_id: int) -> str | None:
+    """Return the repo_name of the most recent ``rebase_attempts`` row with
+    ``result='conflict'`` for this bug, or ``None`` if none exist."""
+    session = engine_module.SessionLocal()
+    try:
+        attempts = repo_module.list_rebase_attempts(session, bug_id)
+        conflicts = [a for a in attempts if a.result == "conflict"]
+        if not conflicts:
+            return None
+        return str(conflicts[-1].repo_name)
+    finally:
+        session.close()
+
+
+def _clear_conflict_files_sync(bug_id: int) -> None:
+    session = engine_module.SessionLocal()
+    try:
+        repo_module.clear_conflict_files(session, bug_id)
+        session.commit()
+    except Exception:
+        session.rollback()
+        logger.exception(
+            "clear_conflict_files failed for bug %d (swallowed)", bug_id
+        )
+    finally:
+        session.close()
+
+
 __all__ = [
     "reinvestigate_with_feedback",
+    "retry_fixer_with_conflict",
     "retry_last_agent",
     "run_pipeline",
     "run_pipeline_with_escalation_context",

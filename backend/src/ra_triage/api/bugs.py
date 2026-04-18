@@ -35,6 +35,7 @@ from ra_triage.integrations.notion import NotionClient, normalize_page
 from ra_triage.orchestrator.merge import merge_bug
 from ra_triage.orchestrator.pipeline import (
     reinvestigate_with_feedback,
+    retry_fixer_with_conflict,
     retry_last_agent,
     run_pipeline,
 )
@@ -180,7 +181,10 @@ def _bug_to_response(bug: Bug, *, launched_bug_id: int | None) -> BugResponse:
         updated_at=bug.updated_at,
         terminated_at=bug.terminated_at,
         current_agent=None,  # v2: Agent 5 populates
-        conflict_files=None,  # v2: Agent 11 populates
+        # Agent 11: populated when the rebase sweeper flagged this bug;
+        # None otherwise. The frontend's conflict indicator / panel use
+        # this to decide whether to render.
+        conflict_files=repo.parse_conflict_files(bug.conflict_files),
         launched_for_testing=(launched_bug_id is not None and launched_bug_id == bug.id),
         pull_requests=prs,
     )
@@ -1157,3 +1161,204 @@ def _append_take_over_marker(bug: Bug) -> None:
         logger.exception(
             "Could not append Taken Over Manually section to %s", triage_md_path
         )
+
+
+# --- Agent 11: Rebase attempts + conflict diff + retry-with-conflict ----
+
+
+class RebaseAttemptResponse(BaseModel):
+    """Public view of a ``rebase_attempts`` row for audit display."""
+
+    id: int
+    bug_id: int
+    repo_name: str
+    trigger_bug_id: int
+    result: str
+    conflict_files: list[str] = Field(default_factory=list)
+    created_at: datetime
+
+
+class ConflictDiffResponse(BaseModel):
+    """Snapshot of the diff surface for a BLOCKED-with-conflict bug."""
+
+    bug_id: int
+    repo_name: str
+    diff: str
+
+
+class RetryFixerWithConflictResponse(BaseModel):
+    """Response for ``POST /bugs/:id/retry-fixer-with-conflict``."""
+
+    status: str
+    bug_id: int
+    new_state: str
+
+
+@router.get(
+    "/bugs/{bug_id}/rebase-attempts",
+    response_model=list[RebaseAttemptResponse],
+    tags=["conflicts"],
+)
+def list_rebase_attempts_endpoint(
+    bug_id: int,
+    session: Session = Depends(get_session),
+) -> list[RebaseAttemptResponse]:
+    """Return the audit list of rebase attempts for a bug, oldest-first."""
+    bug = repo.get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+    rows = repo.list_rebase_attempts(session, bug_id)
+    out: list[RebaseAttemptResponse] = []
+    for row in rows:
+        files = repo.parse_conflict_files(row.conflict_files) or []
+        out.append(
+            RebaseAttemptResponse(
+                id=row.id,
+                bug_id=row.bug_id,
+                repo_name=row.repo_name,
+                trigger_bug_id=row.trigger_bug_id,
+                result=row.result,
+                conflict_files=files,
+                created_at=row.created_at,
+            )
+        )
+    return out
+
+
+@router.get(
+    "/bugs/{bug_id}/conflict-diff",
+    response_model=ConflictDiffResponse,
+    tags=["conflicts"],
+)
+async def get_conflict_diff_endpoint(
+    bug_id: int,
+    repo_name: str | None = Query(
+        default=None,
+        description=(
+            "Repo the conflict occurred in. Optional — if omitted, "
+            "the most recent conflict row's repo is used."
+        ),
+        alias="repo",
+    ),
+) -> ConflictDiffResponse:
+    """Return a ``git diff origin/<main>...HEAD`` snapshot for the bug's
+    conflict worktree.
+
+    Used by the frontend's ConflictPanel to display the diff context
+    alongside the file list. Returns an empty diff string if the
+    worktree is gone or git failed — the UI degrades to "(no snapshot
+    available)".
+
+    404 if the bug doesn't exist, doesn't have a conflict, or the
+    inferred repo_name isn't in the project registry.
+    """
+    session = engine_module.SessionLocal()
+    try:
+        bug = repo.get_bug(session, bug_id)
+        if bug is None:
+            raise HTTPException(
+                status_code=404, detail=f"Bug {bug_id} not found"
+            )
+        bug_project_id = bug.project_id
+        # Use a snapshot-only dict so we don't hold the session across
+        # the async call below.
+        files = repo.parse_conflict_files(bug.conflict_files)
+        inferred_repo = repo_name
+        if inferred_repo is None:
+            attempts = repo.list_rebase_attempts(session, bug_id)
+            conflicts = [a for a in attempts if a.result == "conflict"]
+            if conflicts:
+                inferred_repo = conflicts[-1].repo_name
+    finally:
+        session.close()
+
+    if files is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Bug {bug_id} has no active conflict",
+        )
+    if inferred_repo is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Bug {bug_id} has no conflict row to infer repo from",
+        )
+
+    try:
+        project = get_project(bug_project_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown project: {bug_project_id}"
+        ) from exc
+
+    from ra_triage.workspaces import rebase as rebase_module
+
+    diff = await rebase_module.fetch_conflict_diff(
+        bug_id=bug_id,
+        repo_name=inferred_repo,
+        project=project,
+    )
+    return ConflictDiffResponse(
+        bug_id=bug_id,
+        repo_name=inferred_repo,
+        diff=diff,
+    )
+
+
+@router.post(
+    "/bugs/{bug_id}/retry-fixer-with-conflict",
+    response_model=RetryFixerWithConflictResponse,
+    status_code=202,
+    tags=["conflicts"],
+)
+def retry_fixer_with_conflict_endpoint(
+    bug_id: int,
+    session: Session = Depends(get_session),
+) -> RetryFixerWithConflictResponse:
+    """Kick off the retry-Fixer-with-conflict-context flow.
+
+    Validates that the bug is BLOCKED AND has a non-null
+    ``conflict_files`` column. Returns 202 immediately; the pipeline
+    coroutine runs as a background task and handles the BLOCKED →
+    FIXING (or FIXING_PARALLEL) transition + conflict_context threading.
+
+    409 if the bug is not in BLOCKED or has no active conflict.
+    """
+    bug = repo.get_bug(session, bug_id)
+    if bug is None:
+        raise HTTPException(status_code=404, detail=f"Bug {bug_id} not found")
+    if bug.state != BugState.BLOCKED.value:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Bug {bug_id} is in state {bug.state!r}; retry-fixer-"
+                "with-conflict requires BLOCKED"
+            ),
+        )
+    if repo.parse_conflict_files(bug.conflict_files) is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Bug {bug_id} is BLOCKED but has no active conflict; "
+                "use /retry for the generic retry flow"
+            ),
+        )
+
+    # Determine projected next state for the response body. We don't
+    # transition here — the coroutine does — but the frontend wants the
+    # projected state to optimistically refetch the bug.
+    scope = (bug.scope or "").strip()
+    projected = (
+        BugState.FIXING_PARALLEL.value
+        if scope == "cross-repo"
+        else BugState.FIXING.value
+    )
+
+    _schedule_coro(
+        retry_fixer_with_conflict(bug_id),
+        name=f"retry_fixer_with_conflict:{bug_id}",
+    )
+    return RetryFixerWithConflictResponse(
+        status="retrying",
+        bug_id=bug_id,
+        new_state=projected,
+    )

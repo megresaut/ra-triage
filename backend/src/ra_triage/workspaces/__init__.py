@@ -13,6 +13,12 @@ Public API (from ``worktree``):
   :class:`WorktreeAlreadyExistsError` — exception hierarchy.
 """
 
+from ra_triage.workspaces import rebase
+from ra_triage.workspaces.rebase import (
+    RebaseResult,
+    fetch_conflict_diff,
+    rebase_in_flight,
+)
 from ra_triage.workspaces.worktree import (
     DirtyCanonicalCloneError,
     WorktreeAlreadyExistsError,
@@ -26,11 +32,15 @@ from ra_triage.workspaces.worktree import (
 
 __all__ = [
     "DirtyCanonicalCloneError",
+    "RebaseResult",
     "WorktreeAlreadyExistsError",
     "WorktreeError",
     "branch_name",
     "cleanup",
     "create_worktrees_for_bug",
+    "fetch_conflict_diff",
     "list_worktrees",
     "path_for",
+    "rebase",
+    "rebase_in_flight",
 ]

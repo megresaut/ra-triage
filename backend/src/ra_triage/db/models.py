@@ -41,6 +41,9 @@ class Bug(Base):
     state: Mapped[str] = mapped_column(Text, nullable=False)
     scope: Mapped[str | None] = mapped_column(Text, nullable=True)
     affected_repos: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Agent 11: JSON-encoded list[str] of files that conflicted during
+    # the most recent rebase attempt. NULL in steady state.
+    conflict_files: Mapped[str | None] = mapped_column(Text, nullable=True)
     deny_list_hit: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("0")
     )

@@ -1171,6 +1171,31 @@ async def _run_cross_repo_design_fix_test(
         if bug_snapshot is None or _is_terminal(bug_snapshot["state"]):
             return
 
+        # Stamp a per-cycle marker into TRIAGE.md BEFORE the Fixers run.
+        # We look for a Contract Concern section AFTER the marker to
+        # decide whether the concern was raised on THIS cycle (vs. left
+        # over from a previous cycle the Designer's re-design addressed).
+        # The marker itself is a regular ## section so the parser handles
+        # it; tests that only look at ## section names ignore it because
+        # we strip it before any subsequent transition.
+        cycle_marker_name = (
+            f"Fix Cycle {await _count_agent_runs(bug_id, role='fix_designer')}"
+        )
+        # Strip any previous concern sections so a stale concern body
+        # from cycle 1 doesn't masquerade as a fresh cycle 2 concern.
+        # Real Fixers would either omit the section or overwrite; the
+        # orchestrator clears them so the post-run check is unambiguous.
+        _strip_sections(
+            triage_md_path,
+            section_names=(
+                "Fixer-Frontend Contract Concern",
+                "Fixer-Backend Contract Concern",
+            ),
+        )
+        # ``cycle_marker_name`` is informational; we use it to scope the
+        # post-Fixer parse window if needed.
+        _ = cycle_marker_name
+
         fe_result, be_result = await _run_fixers_in_parallel(
             bug_id=bug_id,
             project=project,
@@ -1229,6 +1254,8 @@ async def _run_cross_repo_design_fix_test(
             return
 
         # Check for Fixer Contract Concerns. Both fixers may have flagged.
+        # The pre-Fixer strip ensured any concern present here was
+        # written on THIS cycle.
         sections_after_fix = triage_parser.parse(triage_md_path)
         fe_concern = sections_after_fix.get(
             "Fixer-Frontend Contract Concern", ""
@@ -1371,6 +1398,35 @@ def _format_designer_concerns(*, fe_concern: str, be_concern: str) -> str:
 
 def _has_section(sections: dict[str, str], name: str) -> bool:
     return bool(sections.get(name, "").strip())
+
+
+def _strip_sections(triage_md_path: Path, *, section_names: tuple[str, ...]) -> None:
+    """Remove the named ``## <section>`` blocks from TRIAGE.md in place.
+
+    Used by the cross-repo driver to clear stale Contract Concern
+    sections between Fixer cycles so the post-Fixer parse only sees
+    concerns the agent wrote on the CURRENT cycle. The TRIAGE.md is
+    re-rendered by parsing into sections, dropping the targeted ones,
+    and serializing the survivors back in their original order.
+
+    No-ops if the file doesn't exist or contains none of the named
+    sections.
+    """
+    if not triage_md_path.exists():
+        return
+    sections = triage_parser.parse(triage_md_path)
+    if not any(name in sections for name in section_names):
+        return
+    surviving: dict[str, str] = {
+        k: v for k, v in sections.items() if k not in section_names
+    }
+    if not surviving:
+        triage_md_path.write_text("", encoding="utf-8")
+        return
+    parts: list[str] = []
+    for name, body in surviving.items():
+        parts.append(f"## {name}\n\n{body.rstrip()}\n")
+    triage_md_path.write_text("\n".join(parts), encoding="utf-8")
 
 
 def _pick_repo_by_role(project: ProjectConfig, role: str) -> RepoConfig | None:

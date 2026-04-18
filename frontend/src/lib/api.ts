@@ -571,3 +571,97 @@ export async function clearManualReviewFlag(
     { signal },
   );
 }
+
+// --- Agent 13 additions: Settings page -----------------------------------
+
+/** Public-safe view of one repo, mirroring backend ``SettingsRepoView``. */
+export interface SettingsRepoView {
+  name: string;
+  role: string;
+  branch_prefix: string;
+  main_branch: string;
+  dev_port: number;
+  test_launch_port: number;
+  integration_port: number;
+  github_origin: string;
+}
+
+/** Read-only deny-list view for the Settings UI. */
+export interface SettingsDenyListView {
+  paths: string[];
+  categories: string[];
+}
+
+/**
+ * One project's full Settings view. ``auto_merge`` is the *effective*
+ * value (override-or-default); ``auto_merge_default`` is the registry
+ * hardcoded value, surfaced so the UI can show "(default: off)" when
+ * an override is in place.
+ */
+export interface SettingsProjectView {
+  id: string;
+  display_name: string;
+  auto_merge: boolean;
+  auto_merge_default: boolean;
+  repos: SettingsRepoView[];
+  deny_list: SettingsDenyListView;
+}
+
+/** Top-level shape of ``GET /settings``. */
+export interface SettingsResponse {
+  projects: SettingsProjectView[];
+}
+
+/** Response from ``PUT /settings/projects/{id}``. */
+export interface UpdateProjectSettingsResponse {
+  project_id: string;
+  auto_merge: boolean;
+  auto_merge_default: boolean;
+}
+
+/** GET /settings — registry view + auto-merge effective/default per project. */
+export async function fetchSettings(
+  signal?: AbortSignal,
+): Promise<SettingsResponse> {
+  return apiGet<SettingsResponse>("/settings", { signal });
+}
+
+/**
+ * PUT /settings/projects/{id} — toggle the per-project auto-merge override.
+ *
+ * **Behavior contract:** in v1 this is persisted but does NOT change merging
+ * behavior — every fix still requires a manual Confirm click. The UI
+ * surfaces a tooltip explaining this.
+ */
+export async function updateProjectAutoMerge(
+  projectId: string,
+  autoMerge: boolean,
+  signal?: AbortSignal,
+): Promise<UpdateProjectSettingsResponse> {
+  const url = `${BACKEND_BASE_URL}/settings/projects/${encodeURIComponent(
+    projectId,
+  )}`;
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ auto_merge: autoMerge }),
+    signal,
+  });
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const parsed = (await response.json()) as { detail?: string };
+      if (typeof parsed.detail === "string") {
+        detail = parsed.detail;
+      }
+    } catch {
+      // Ignore — non-JSON body.
+    }
+    throw new ApiError(
+      `/settings/projects/${projectId}`,
+      response.status,
+      detail,
+    );
+  }
+  return (await response.json()) as UpdateProjectSettingsResponse;
+}

@@ -44,6 +44,13 @@ class Bug(Base):
     # Agent 11: JSON-encoded list[str] of files that conflicted during
     # the most recent rebase attempt. NULL in steady state.
     conflict_files: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Agent 12: True when the resume-on-boot path observed an inconsistent
+    # state for this bug (e.g. state=READY_FOR_REVIEW but no Tester run).
+    # The frontend renders a yellow banner pointing at TRIAGE.md until the
+    # operator dismisses via POST /bugs/:id/clear-manual-review-flag.
+    needs_manual_review: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("0"), default=False
+    )
     deny_list_hit: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("0")
     )

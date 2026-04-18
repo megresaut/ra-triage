@@ -279,6 +279,18 @@ class TestInstanceManager:
         await asyncio.to_thread(
             self._mark_row_crashed, inst.db_instance_row_id
         )
+
+        # Agent 12: include the tail of every proc's log file so the
+        # frontend can render the immediate cause of the crash inline
+        # (rather than making the operator chase the file path). 20
+        # lines is enough for a Python traceback or a Go panic; longer
+        # tails would bloat the WS frame.
+        log_tails: dict[str, list[str]] = {}
+        for name, sp in inst.procs.items():
+            log_tails[name] = await asyncio.to_thread(
+                _tail_log, sp.log_path, 20
+            )
+
         await self._broadcast_status(
             bug_id=inst.bug_id,
             status="crashed",
@@ -286,6 +298,8 @@ class TestInstanceManager:
             ports={name: sp.port for name, sp in inst.procs.items()},
             pids={name: sp.pid for name, sp in inst.procs.items()},
             dead_procs=dead,
+            reason="process_exited",
+            log_tails=log_tails,
         )
         self._current = None
         return True
@@ -684,6 +698,29 @@ def _npm_lock_hash(worktree: Path) -> str:
 
 def _npm_cache_marker(repo_name: str, lock_hash: str) -> Path:
     return get_settings().triage_home / "npm-cache" / repo_name / lock_hash
+
+
+def _tail_log(log_path: Path, n: int) -> list[str]:
+    """Return the last ``n`` lines of ``log_path`` (stripped of trailing \\n).
+
+    Returns an empty list on any I/O error or missing file. Used by the
+    crash-broadcast helper to surface immediate diagnostics in the WS
+    frame without exposing the full file (which can be megabytes).
+    """
+    try:
+        if not log_path.exists():
+            return []
+        with log_path.open("r", encoding="utf-8", errors="replace") as fp:
+            lines = fp.readlines()
+        tail = lines[-n:] if len(lines) > n else lines
+        return [line.rstrip("\n") for line in tail]
+    except Exception:
+        logger.warning(
+            "test instance crash-broadcast: tail of %s failed (swallowed)",
+            log_path,
+            exc_info=True,
+        )
+        return []
 
 
 async def _run_npm_ci(worktree: Path) -> None:

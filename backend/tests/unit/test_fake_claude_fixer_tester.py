@@ -66,6 +66,7 @@ def _fixer_context(bug_id: int) -> dict[str, Any]:
         "build_command": "go build ./...",
         "deny_list": {"paths": ["**/auth/**"], "categories": ["auth"]},
         "escalation_context": None,
+        "conflict_context": None,
     }
 
 

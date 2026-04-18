@@ -9,6 +9,7 @@ import StatusBadge from "@/components/StatusBadge";
 import TestInstancePanel from "@/components/TestInstancePanel";
 import TriageMarkdown from "@/components/TriageMarkdown";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useBugDetail } from "@/hooks/useBugDetail";
 import { useTriage } from "@/hooks/useTriage";
 import type { Bug, PullRequest } from "@/lib/api";
@@ -207,10 +208,30 @@ function PullRequestsCard({
   if (pull_requests.length === 0) {
     return null;
   }
+  // For cross-repo merges we want the operator to see which PR merged
+  // first (backend is merged before frontend per the Agent 10 flow).
+  // The backend marks merged_at on successful merges; we compute a
+  // per-PR "merged first" label by sorting merged PRs by merged_at.
+  const merged = pull_requests
+    .filter((pr) => pr.status === "merged" && pr.merged_at)
+    .sort((a, b) => {
+      const aT = a.merged_at ? Date.parse(a.merged_at) : 0;
+      const bT = b.merged_at ? Date.parse(b.merged_at) : 0;
+      return aT - bT;
+    });
+  const firstMergedId = merged.length > 0 ? merged[0].id : null;
+  const isCrossRepo = pull_requests.length > 1;
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-base">Pull Requests</CardTitle>
+        <CardTitle className="text-base">
+          Pull Requests
+          {isCrossRepo && (
+            <span className="ml-2 text-xs font-mono text-muted-foreground">
+              cross-repo
+            </span>
+          )}
+        </CardTitle>
       </CardHeader>
       <CardContent className="space-y-1 text-sm">
         {pull_requests.map((pr) => (
@@ -241,6 +262,11 @@ function PullRequestsCard({
             >
               {pr.status}
             </span>
+            {isCrossRepo && pr.id === firstMergedId && (
+              <span className="text-xs text-green-700 italic">
+                (merged first)
+              </span>
+            )}
           </div>
         ))}
       </CardContent>
@@ -250,9 +276,6 @@ function PullRequestsCard({
 
 function DiffPanel({ bug }: { bug: Bug }) {
   const repos = bug.affected_repos ?? [];
-  // Single-repo bugs are the Agent 6 happy path. Cross-repo (Agent 10)
-  // will wrap N DiffViewers in Tabs; for now we render a clear stub so
-  // operators know what's coming.
   if (repos.length === 0) {
     return (
       <Card>
@@ -269,16 +292,39 @@ function DiffPanel({ bug }: { bug: Bug }) {
   if (repos.length === 1) {
     return <DiffViewer bugId={bug.id} repo={repos[0]} state={bug.state} />;
   }
+  // Cross-repo (Agent 10): one tab per repo, each loading its own DiffViewer.
+  // The existing DiffViewer card renders fine inside a tab's content. We
+  // default the active tab to the first repo in registry order (backend
+  // for AVM).
   return (
     <Card>
       <CardHeader>
         <CardTitle className="text-base">
-          Cross-repo diff (Agent 10)
+          Cross-repo diff
+          <span className="ml-2 text-xs font-mono text-muted-foreground">
+            {repos.length} repos
+          </span>
         </CardTitle>
       </CardHeader>
-      <CardContent className="text-sm text-muted-foreground">
-        Cross-repo tabs come online in Agent 10. Affected repos:{" "}
-        {repos.join(", ")}.
+      <CardContent>
+        <Tabs defaultValue={repos[0]} className="w-full">
+          <TabsList>
+            {repos.map((repoName) => (
+              <TabsTrigger key={repoName} value={repoName}>
+                {repoName}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+          {repos.map((repoName) => (
+            <TabsContent key={repoName} value={repoName}>
+              <DiffViewer
+                bugId={bug.id}
+                repo={repoName}
+                state={bug.state}
+              />
+            </TabsContent>
+          ))}
+        </Tabs>
       </CardContent>
     </Card>
   );

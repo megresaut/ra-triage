@@ -335,7 +335,12 @@ async def test_pipeline_cross_repo_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     stub_worktrees: dict[str, Path],
 ) -> None:
-    """Cross-repo stub walks DESIGNING → FIXING_PARALLEL → INTEGRATION_TESTING → READY_FOR_REVIEW."""
+    """Cross-repo: DESIGNING → FIXING_PARALLEL → INTEGRATION_TESTING → READY_FOR_REVIEW.
+
+    Stubs the Investigator, the Fix Designer, BOTH Fixers, and the
+    Integration Tester. Since Agent 10 replaced the cross-repo stub with
+    the real driver, this test exercises the full set of agents.
+    """
     triage_md = (
         "## Root Cause\n\napi/page.go:10 + ui/page.tsx:20\n\n"
         "## Scope\n\n"
@@ -351,6 +356,55 @@ async def test_pipeline_cross_repo_happy_path(
         _make_fake_investigator(
             completion_token="INVESTIGATOR_COMPLETE",
             triage_md_body=triage_md,
+        ),
+    )
+    # Stub the four cross-repo agents Agent 10 added. The contract
+    # section is required for the orchestrator to advance from DESIGNING
+    # to FIXING_PARALLEL.
+    monkeypatch.setattr(
+        pipeline_module,
+        "FixDesigner",
+        _make_fake_agent(
+            role="fix_designer",
+            completion_token="FIX_DESIGNER_COMPLETE",
+            append_section="Cross-Repo Contract",
+            append_body=(
+                "### Shared Data Shape\nuser: { id, name }\n\n"
+                "### Backend Responsibilities\nGET /users/:id\n\n"
+                "### Frontend Responsibilities\nrender card on 200\n\n"
+                "### Shared Assumptions\nbackward-compat\n\n"
+                "### Integration Test Scenario\n1. POST 2. GET 3. assert\n"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "FixerFrontend",
+        _make_fake_agent(
+            role="fixer_frontend",
+            completion_token="FIXER_FRONTEND_COMPLETE",
+            append_section="Fixer-Frontend Notes",
+            append_body="- Files changed: src/UserCard.tsx\n",
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "FixerBackend",
+        _make_fake_agent(
+            role="fixer_backend",
+            completion_token="FIXER_BACKEND_COMPLETE",
+            append_section="Fixer-Backend Notes",
+            append_body="- Files changed: api/handlers/user.go\n",
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "IntegrationTester",
+        _make_fake_agent(
+            role="integration_tester",
+            completion_token="INTEGRATION_TESTER_COMPLETE",
+            append_section="Integration Tester Notes",
+            append_body="- Scenario result: passed\n",
         ),
     )
 
@@ -369,6 +423,16 @@ async def test_pipeline_cross_repo_happy_path(
         assert bug.state == BugState.READY_FOR_REVIEW.value
         assert bug.scope == "cross-repo"
         assert bug.affected_repos == '["avm-backend", "builder-frontend"]'
+        # All four cross-repo agents should have run, in order.
+        runs = repo_module.list_agent_runs(session, bug_id)
+        roles = [r.agent_role for r in runs]
+        assert roles == [
+            "investigator",
+            "fix_designer",
+            "fixer_frontend",
+            "fixer_backend",
+            "integration_tester",
+        ]
     finally:
         session.close()
 

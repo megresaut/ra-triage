@@ -365,7 +365,7 @@ async def _update_cross_ref_bodies(
     # 3+ repos: each PR points at the next one (registry order), so the
     # cross-references form a cycle the operator can navigate.
     other_url: dict[str, str] = {}
-    for idx, (repo_cfg, pr_info) in enumerate(pr_infos):
+    for idx, (repo_cfg, _pr_info) in enumerate(pr_infos):
         other_idx = (idx + 1) % len(pr_infos)
         other_url[repo_cfg.name] = pr_infos[other_idx][1].url
 

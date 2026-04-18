@@ -10,7 +10,7 @@ WORKTREE: {{ worktree_path }} (branch triage/{{ bug.id }} checked out; this is y
 BUILD CMD: {{ build_command }}
 DENY-LIST paths (do not modify): {{ deny_list.paths | join(", ") }}
 
-Read TRIAGE.md "Cross-Repo Contract". Your slice is
+Read {{ triage_md_path }} "Cross-Repo Contract". Your slice is
 "{{ side }} Responsibilities" and "Shared Data Shape".
 
 {% if escalation_context %}
@@ -19,19 +19,21 @@ HUMAN-APPROVED ESCALATION CONTEXT. Incorporate this guidance into your fix:
 {% endif %}
 
 CONSTRAINTS
-  - Modify only files in this repo ({{ worktree_path }}).
+  - Modify only files in this repo ({{ worktree_path }}). The shared
+    TRIAGE.md at {{ triage_md_path }} (lives in the backend worktree)
+    is the ONLY file outside this repo you may write to.
   - Do NOT modify the contract; flag a mismatch instead by appending a
-    "## Fixer-{{ side }} Contract Concern" section to TRIAGE.md describing
-    exactly which field/type/endpoint is inconsistent and stopping before
-    any further edits.
+    "## Fixer-{{ side }} Contract Concern" section to {{ triage_md_path }}
+    describing exactly which field/type/endpoint is inconsistent and
+    stopping before any further edits.
   - Every shared field name/type MUST match the contract byte-for-byte.
   - Do NOT touch test files or deny-list paths.
 
 STEPS
-  1. Read TRIAGE.md fully.
+  1. Read {{ triage_md_path }} fully.
   2. Implement your side of the contract.
   3. Run {{ build_command }}; resolve any errors introduced.
-  4. APPEND to TRIAGE.md:
+  4. APPEND to {{ triage_md_path }}:
 
 ## Fixer-{{ side }} Notes
 - Files changed: <list>

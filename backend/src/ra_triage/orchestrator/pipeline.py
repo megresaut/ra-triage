@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -287,6 +288,13 @@ async def _route_after_investigator(
             completion_token,
             escalated,
         )
+        # Persist the structured Escalation row + mirror to Notion BEFORE
+        # the state transition so any downstream observer (hook, API) that
+        # races the transition already sees the row.
+        if escalated:
+            await _persist_escalation_for_bug(
+                bug_id=bug_id, sections=sections, scope=scope
+            )
         await _transition(bug_id, BugState.BLOCKED)
         return
 
@@ -335,6 +343,7 @@ async def _run_single_repo_fix_and_test(
     project: ProjectConfig,
     scope: dict[str, Any],
     triage_md_path: Path,
+    escalation_context: str | None = None,
 ) -> None:
     """Drive INVESTIGATING → FIXING → TESTING → READY_FOR_REVIEW (or BLOCKED).
 
@@ -378,16 +387,24 @@ async def _run_single_repo_fix_and_test(
     worktree = wt_module.path_for(bug_id, repo_config.name)
 
     # ---- FIXING ---------------------------------------------------
-    await _transition(bug_id, BugState.FIXING)
+    # If we're already in FIXING (e.g. the approve-escalation flow
+    # transitioned us here before calling us), don't attempt the
+    # redundant transition — the state machine would reject it.
     bug_snapshot = await _load_bug(bug_id)
     if bug_snapshot is None or _is_terminal(bug_snapshot["state"]):
         return
+    if BugState(bug_snapshot["state"]) != BugState.FIXING:
+        await _transition(bug_id, BugState.FIXING)
+        bug_snapshot = await _load_bug(bug_id)
+        if bug_snapshot is None or _is_terminal(bug_snapshot["state"]):
+            return
 
     fixer_result = await _run_fixer(
         bug_id=bug_id,
         repo_config=repo_config,
         worktree=worktree,
         triage_md_path=triage_md_path,
+        escalation_context=escalation_context,
     )
 
     # Post-Fixer routing. We check both the completion token and the
@@ -500,8 +517,15 @@ async def _run_fixer(
     repo_config: RepoConfig,
     worktree: Path,
     triage_md_path: Path,
+    escalation_context: str | None = None,
 ) -> AgentResult:
-    """Spawn the Fixer, record its agent_runs row, return the result."""
+    """Spawn the Fixer, record its agent_runs row, return the result.
+
+    ``escalation_context`` is threaded through into the Fixer prompt
+    template's ``{% if escalation_context %}`` block when the caller is
+    the approve / pick-alternative flow (Agent 9). Forward-path runs
+    leave it ``None``.
+    """
     attempt = await _next_attempt(bug_id, role="fixer")
     started_at = _utcnow()
 
@@ -532,9 +556,10 @@ async def _run_fixer(
             "paths": list(project.deny_list.paths),
             "categories": list(project.deny_list.categories),
         },
-        # Agent 9 will set ``escalation_context`` via the approve flow.
-        # Keep the key present (None) so StrictUndefined doesn't trip.
-        "escalation_context": None,
+        # Agent 9 sets ``escalation_context`` via the approve / pick-alt
+        # flow. Forward-path runs pass None; the Fixer prompt's
+        # ``{% if escalation_context %}`` block degrades cleanly.
+        "escalation_context": escalation_context,
         "attempt": attempt,
     }
 
@@ -922,6 +947,146 @@ def _finalize_agent_run_sync(
     except Exception:
         session.rollback()
         raise
+    finally:
+        session.close()
+
+
+async def _persist_escalation_for_bug(
+    *,
+    bug_id: int,
+    sections: dict[str, str],
+    scope: dict[str, Any],
+) -> None:
+    """Record an ``escalations`` row + mirror the brief to Notion.
+
+    Dispatched from ``_route_after_investigator`` when the Investigator
+    produced a populated Escalation Brief. Best-effort:
+
+      - DB insert uses a scoped session and swallows failure (the row is
+        nice-to-have; if the DB is wedged the bug will still transition
+        to BLOCKED and the brief lives in TRIAGE.md).
+      - Notion mirror runs via ``append_block`` on the bug's page, so
+        Megha sees the full brief in Notion too. Any Notion failure
+        logs and is swallowed — product plan explicitly calls this out.
+    """
+    brief_markdown = sections.get("Escalation Brief", "")
+    if not brief_markdown.strip():
+        return
+    parsed = triage_parser.parse_escalation_brief(sections)
+    options_list: list[dict[str, Any]] = []
+    if parsed is not None:
+        options_list = [asdict(opt) for opt in parsed.options]
+    # Trigger classification: deny-list hit vs. judgment call. Mirrors
+    # the orchestrator brief's "triggered_rule" contract.
+    triggered_rule = "deny_list" if scope.get("deny_list_hit") else "judgment"
+    options_json = json.dumps(options_list)
+
+    await asyncio.to_thread(
+        _record_escalation_sync,
+        bug_id,
+        triggered_rule,
+        brief_markdown,
+        options_json,
+    )
+    await _mirror_escalation_to_notion(bug_id=bug_id, brief_markdown=brief_markdown)
+
+
+def _record_escalation_sync(
+    bug_id: int,
+    triggered_rule: str,
+    brief_markdown: str,
+    options_json: str,
+) -> None:
+    session = engine_module.SessionLocal()
+    try:
+        repo_module.record_escalation(
+            session,
+            bug_id=bug_id,
+            triggered_rule=triggered_rule,
+            brief_markdown=brief_markdown,
+            options=options_json,
+        )
+        session.commit()
+    except Exception:
+        session.rollback()
+        logger.exception(
+            "record_escalation failed for bug_id=%s — swallowing so transition "
+            "still fires",
+            bug_id,
+        )
+    finally:
+        session.close()
+
+
+async def _mirror_escalation_to_notion(
+    *, bug_id: int, brief_markdown: str
+) -> None:
+    """Append the full Escalation Brief to the bug's Notion page.
+
+    Best-effort; Notion outages or unconfigured credentials never bubble
+    out. The parent bug's ``notion_page_id`` drives which page receives
+    the block.
+    """
+    try:
+        page_id = await _load_notion_page_id(bug_id)
+        if not page_id:
+            return
+        await asyncio.to_thread(
+            _append_escalation_to_notion_sync, page_id, brief_markdown
+        )
+    except Exception:
+        logger.exception(
+            "Notion mirror for escalation failed (bug_id=%s) — swallowing",
+            bug_id,
+        )
+
+
+def _append_escalation_to_notion_sync(page_id: str, brief_markdown: str) -> None:
+    """Append ``## Escalation Brief`` + the body to a Notion page.
+
+    Separate module imports are inside the function body so the pipeline
+    module stays importable without notion-client installed / network
+    access available (important for test environments).
+    """
+    try:
+        from ra_triage.integrations import notion as notion_module
+    except Exception:  # pragma: no cover - defensive
+        return
+    builder = notion_module._current_client_builder()
+    try:
+        client = builder()
+    except Exception:
+        logger.exception(
+            "Notion mirror: builder raised for page_id=%s — swallowing", page_id
+        )
+        return
+    if client is None:
+        logger.debug(
+            "Notion mirror: NotionClient unconfigured, skipping (page_id=%s)",
+            page_id,
+        )
+        return
+    markdown = "## Escalation Brief\n\n" + brief_markdown.rstrip() + "\n"
+    try:
+        client.append_block(page_id=page_id, markdown_text=markdown)
+    except Exception:
+        logger.exception(
+            "Notion mirror: append_block failed (page_id=%s) — swallowing",
+            page_id,
+        )
+
+
+async def _load_notion_page_id(bug_id: int) -> str | None:
+    return await asyncio.to_thread(_load_notion_page_id_sync, bug_id)
+
+
+def _load_notion_page_id_sync(bug_id: int) -> str | None:
+    session = engine_module.SessionLocal()
+    try:
+        bug = repo_module.get_bug(session, bug_id)
+        if bug is None:
+            return None
+        return bug.notion_page_id or None
     finally:
         session.close()
 
@@ -1337,8 +1502,119 @@ def _load_latest_agent_run_sync(bug_id: int) -> dict[str, Any] | None:
         session.close()
 
 
+# --- Agent 9: Approve / Pick-alternative entry point ---------------------
+
+
+async def run_pipeline_with_escalation_context(
+    bug_id: int, escalation_context: str
+) -> None:
+    """Drive a BLOCKED bug forward after the reviewer picks an option.
+
+    Contract (Agent 9):
+
+      - Caller has already transitioned the bug FROM ``BLOCKED`` TO the
+        appropriate working state (``FIXING`` for single-repo,
+        ``FIXING_PARALLEL`` for cross-repo) and recorded the escalation
+        resolution on the ``escalations`` row.
+      - We spawn the Fixer with ``escalation_context`` rendered into the
+        prompt template's ``{% if escalation_context %}`` block, then
+        continue forward exactly like the Agent 6 / Agent 10 happy path
+        (FIXING → TESTING → READY_FOR_REVIEW for single-repo).
+      - Never raises: exceptions are caught and logged like
+        :func:`run_pipeline`.
+
+    The ``escalation_context`` payload is a human-readable prose summary
+    of the brief + the reviewer's choice. The API handler assembles it
+    from the parsed brief and any notes the reviewer attached.
+    """
+    async with concurrency.PIPELINE_SEMAPHORE:
+        try:
+            await _run_with_escalation_context_body(bug_id, escalation_context)
+        except Exception:
+            logger.exception(
+                "run_pipeline_with_escalation_context crashed for bug_id=%s",
+                bug_id,
+            )
+
+
+async def _run_with_escalation_context_body(
+    bug_id: int, escalation_context: str
+) -> None:
+    bug_snapshot = await _load_bug(bug_id)
+    if bug_snapshot is None:
+        logger.warning(
+            "run_pipeline_with_escalation_context: bug_id=%s not found", bug_id
+        )
+        return
+    if _is_terminal(bug_snapshot["state"]):
+        return
+
+    state = BugState(bug_snapshot["state"])
+    if state not in (BugState.FIXING, BugState.FIXING_PARALLEL):
+        logger.warning(
+            "run_pipeline_with_escalation_context: bug %d not in FIXING/"
+            "FIXING_PARALLEL (state=%s); aborting",
+            bug_id,
+            state.value,
+        )
+        return
+
+    project = get_project(bug_snapshot["project_id"])
+    worktrees = wt_module.list_worktrees(bug_id)
+    if not worktrees:
+        # Worktrees may have been cleaned up if the bug previously
+        # cycled through a terminal state; recreate them.
+        try:
+            worktrees = await wt_module.create_worktrees_for_bug(
+                bug_id, project.repos
+            )
+        except wt_module.WorktreeError as exc:
+            logger.exception(
+                "run_pipeline_with_escalation_context: worktree recreate "
+                "failed for bug %d",
+                bug_id,
+            )
+            await _block_with_escalation(
+                bug_id,
+                project=project,
+                reason_title="Worktree recreate failed during escalation approval",
+                reason_body=str(exc),
+            )
+            return
+
+    triage_md_path = _triage_md_worktree(project, worktrees) / "TRIAGE.md"
+
+    if state == BugState.FIXING:
+        # Single-repo approve flow: re-run the Fixer with escalation
+        # context, then continue forward via the standard single-repo
+        # happy path.
+        sections = triage_parser.parse(triage_md_path)
+        scope = triage_parser.get_scope(sections)
+        await _run_single_repo_fix_and_test(
+            bug_id=bug_id,
+            project=project,
+            scope=scope,
+            triage_md_path=triage_md_path,
+            escalation_context=escalation_context,
+        )
+        return
+
+    # FIXING_PARALLEL (cross-repo approve flow). Agent 10 lands the full
+    # cross-repo driver; for now we stub-advance so the state machine
+    # doesn't hang. Agent 10 will replace this with the real run.
+    logger.warning(
+        "Agent 9 stub: cross-repo approve flow not yet implemented — "
+        "advancing bug %d via stub path (Agent 10 will wire the real "
+        "FIXING_PARALLEL → INTEGRATION_TESTING → RFR cycle)",
+        bug_id,
+    )
+    await _transition(bug_id, BugState.INTEGRATION_TESTING)
+    await _transition(bug_id, BugState.READY_FOR_REVIEW)
+
+
 __all__ = [
     "reinvestigate_with_feedback",
     "retry_last_agent",
     "run_pipeline",
+    "run_pipeline_with_escalation_context",
 ]

@@ -19,7 +19,14 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ra_triage.db.models import AgentRun, Bug, PullRequest, Rejection, TestInstance
+from ra_triage.db.models import (
+    AgentRun,
+    Bug,
+    Escalation,
+    PullRequest,
+    Rejection,
+    TestInstance,
+)
 from ra_triage.orchestrator.states import (
     TERMINAL_STATES,
     BugState,
@@ -172,11 +179,26 @@ def _post_transition_hook(bug: Bug, new_state: BugState) -> None:
     """Single post-transition side-effect entry point.
 
     Kept as a thin dispatch so new side effects land here (not sprinkled
-    through callers). Currently: Notion status write-back only.
+    through callers). As of Agent 9 this fans out to three best-effort
+    hooks; each one catches its own exceptions so a downstream outage
+    never rolls back the DB transition:
+
+      1. Notion status write-back (Agent 3).
+      2. Slack escalation ping (Agent 9) — only on BLOCKED when a
+         populated Escalation Brief is present in the bug's TRIAGE.md.
+      3. Slack ready-for-review ping (Agent 9) — only on entering
+         READY_FOR_REVIEW.
 
     All side effects are best-effort: this function never raises. The
     individual helpers log their own failures.
     """
+    _run_notion_writeback(bug, new_state)
+    _run_slack_escalation_hook(bug, new_state)
+    _run_slack_rfr_hook(bug, new_state)
+
+
+def _run_notion_writeback(bug: Bug, new_state: BugState) -> None:
+    """Fire the Notion status write-back; swallow + log on any failure."""
     # Deferred import avoids a module-level cycle:
     #   integrations.notion imports orchestrator.states, which is imported
     #   by this file. Import at call time instead.
@@ -188,6 +210,112 @@ def _post_transition_hook(bug: Bug, new_state: BugState) -> None:
         status_writeback_for_state(bug, new_state)
     except Exception:  # pragma: no cover - the hook already swallows
         pass
+
+
+def _run_slack_escalation_hook(bug: Bug, new_state: BugState) -> None:
+    """Ping Slack on BLOCKED when an unresolved ``escalations`` row exists.
+
+    The pipeline persists the escalations row BEFORE calling
+    :func:`update_bug_state` (per Agent 9 contract), so by the time
+    this hook runs, the row is already in the DB if the transition was
+    triggered by an Investigator-produced Escalation Brief.
+
+    Transitions to BLOCKED that have no corresponding escalation row
+    (e.g. Take Over Manually, Rejection Limit Reached, Merge Failure,
+    worktree setup failure) skip the Slack ping — those flows already
+    have their own surfaces in the frontend + Notion write-back.
+
+    Best-effort; failures are logged + swallowed so the transition
+    never rolls back.
+    """
+    if new_state != BugState.BLOCKED:
+        return
+    import logging
+
+    log = logging.getLogger(__name__)
+    try:
+        from ra_triage.config.registry import get_project
+        from ra_triage.integrations import slack as slack_mod
+    except Exception:  # pragma: no cover - defensive
+        return
+
+    # Look for an unresolved escalation row on the current session's
+    # engine. We open a short-lived session here so we don't have to
+    # thread the caller's session through the hook signature.
+    try:
+        from ra_triage.db import engine as engine_module
+
+        session = engine_module.SessionLocal()
+        try:
+            latest = get_latest_unresolved_escalation(session, int(bug.id))
+        finally:
+            session.close()
+    except Exception:
+        log.exception(
+            "Slack escalation hook: failed to load escalation row for bug_id=%s",
+            bug.id,
+        )
+        return
+
+    if latest is None:
+        log.debug(
+            "Slack escalation hook: no unresolved escalation for bug_id=%s; "
+            "skipping (BLOCKED from a non-escalation path)",
+            bug.id,
+        )
+        return
+
+    try:
+        project_cfg = get_project(bug.project_id)
+    except KeyError:
+        return
+    except Exception:
+        log.exception(
+            "Slack escalation hook: could not resolve project for bug_id=%s",
+            bug.id,
+        )
+        return
+
+    try:
+        slack_mod.notify_escalation(bug, project_cfg)
+    except Exception:  # pragma: no cover - defensive
+        log.exception(
+            "Slack escalation hook: notify_escalation raised for bug_id=%s "
+            "(swallowed)",
+            bug.id,
+        )
+
+
+def _run_slack_rfr_hook(bug: Bug, new_state: BugState) -> None:
+    """Ping Slack on entering READY_FOR_REVIEW. Best-effort."""
+    if new_state != BugState.READY_FOR_REVIEW:
+        return
+    try:
+        from ra_triage.config.registry import get_project
+        from ra_triage.integrations import slack as slack_mod
+    except Exception:  # pragma: no cover
+        return
+    try:
+        project_cfg = get_project(bug.project_id)
+    except KeyError:
+        return
+    except Exception:  # pragma: no cover
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "Slack RFR hook: could not resolve project for bug_id=%s", bug.id
+        )
+        return
+    try:
+        slack_mod.notify_ready_for_review(bug, project_cfg)
+    except Exception:  # pragma: no cover - defensive
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "Slack RFR hook failed for bug_id=%s (swallowed)", bug.id
+        )
+
+
 
 
 # --- AgentRun ----------------------------------------------------------------
@@ -345,6 +473,95 @@ def update_pr_status(
         pr.merged_at = merged_at or _utcnow()
     session.flush()
     return pr
+
+
+# --- Escalation --------------------------------------------------------------
+
+
+def record_escalation(
+    session: Session,
+    *,
+    bug_id: int,
+    triggered_rule: str | None,
+    brief_markdown: str,
+    options: str,
+) -> Escalation:
+    """Persist an ``escalations`` row for a bug.
+
+    Called by the orchestrator when it observes an Escalation Brief in
+    TRIAGE.md and transitions the bug to BLOCKED. The brief + structured
+    options are stored verbatim (options as a JSON-string of
+    ``ParsedBriefOption`` dicts) so the API can replay both for the
+    frontend's action buttons.
+    """
+    row = Escalation(
+        bug_id=bug_id,
+        triggered_rule=triggered_rule,
+        brief_markdown=brief_markdown,
+        options=options,
+        resolution=None,
+        resolved_option=None,
+    )
+    session.add(row)
+    session.flush()
+    return row
+
+
+def list_escalations_for_bug(session: Session, bug_id: int) -> list[Escalation]:
+    """Return every ``escalations`` row for ``bug_id`` ordered oldest-first."""
+    stmt = (
+        select(Escalation)
+        .where(Escalation.bug_id == bug_id)
+        .order_by(Escalation.created_at.asc(), Escalation.id.asc())
+    )
+    return list(session.execute(stmt).scalars())
+
+
+def get_latest_unresolved_escalation(
+    session: Session, bug_id: int
+) -> Escalation | None:
+    """Return the most recent ``escalations`` row for ``bug_id`` whose
+    ``resolution`` is still NULL, or ``None`` if no such row exists.
+
+    Used by the approve / pick-alt / take-over flows to locate the row
+    they should mark as resolved when the user picks an option.
+    """
+    stmt = (
+        select(Escalation)
+        .where(Escalation.bug_id == bug_id)
+        .where(Escalation.resolution.is_(None))
+        .order_by(Escalation.created_at.desc(), Escalation.id.desc())
+        .limit(1)
+    )
+    return session.execute(stmt).scalar_one_or_none()
+
+
+def update_escalation_resolution(
+    session: Session,
+    *,
+    escalation_id: int,
+    resolution: str,
+    resolved_option: str | None,
+) -> Escalation:
+    """Mark an escalation resolved.
+
+    ``resolution`` is one of ``"approved"``, ``"picked_alt"``,
+    ``"taken_over"`` (and could grow in the future). ``resolved_option``
+    is the ``ParsedBriefOption.id`` the user picked (or ``None`` for
+    take-over, which has no specific option beyond the implied
+    ``"take_over"`` — but callers typically pass ``"take_over"``
+    explicitly for clarity).
+
+    Raises :class:`ValueError` if ``escalation_id`` isn't found.
+    """
+    row = session.get(Escalation, escalation_id)
+    if row is None:
+        raise ValueError(f"escalations row {escalation_id} not found")
+    row.resolution = resolution
+    row.resolved_option = resolved_option
+    row.resolved_at = _utcnow()
+    session.flush()
+    return row
 
 
 # --- TestInstance ------------------------------------------------------------

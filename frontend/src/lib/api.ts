@@ -344,3 +344,123 @@ export async function takeOverBug(
     { signal },
   );
 }
+
+// --- Agent 9 additions: Escalation Brief actions -------------------------
+
+/** One option the reviewer can pick on an escalated bug. */
+export interface ParsedBriefOption {
+  id: string;
+  label: string;
+  kind: "approve" | "alternative" | "take_over";
+}
+
+/** Structured view of an Escalation Brief, matching backend `ParsedBriefResponse`. */
+export interface ParsedBrief {
+  tldr: string | null;
+  why_blocked: string | null;
+  the_bug: string | null;
+  why_change_necessary: string | null;
+  proposed_approach: string | null;
+  ranked_alternatives: string[];
+  files_that_would_be_touched: string[];
+  test_plan: string | null;
+  options: ParsedBriefOption[];
+  raw: string;
+}
+
+/** Full escalation row returned by `GET /bugs/:id/escalation`. */
+export interface EscalationDetail {
+  id: number;
+  bug_id: number;
+  triggered_rule: string | null;
+  created_at: string;
+  parsed: ParsedBrief;
+}
+
+/** Response from approve / pick-alternative — matches `EscalationActionResponse`. */
+export interface EscalationActionResult {
+  status: string;
+  bug_id: number;
+  escalation_id: number;
+  new_state: string;
+  resolved_option: string;
+}
+
+/** Response from take-over (escalation-scoped). */
+export interface EscalationTakeOverResult {
+  status: string;
+  bug_id: number;
+  escalation_id: number;
+  resolved_option: string;
+}
+
+/**
+ * GET /bugs/:id/escalation — fetch the latest unresolved escalation.
+ * Resolves to null on 404 (no active escalation / bug not found) so callers
+ * can render nothing without a loud error.
+ */
+export async function fetchEscalation(
+  bugId: number,
+  signal?: AbortSignal,
+): Promise<EscalationDetail | null> {
+  const url = `${BACKEND_BASE_URL}/bugs/${bugId}/escalation`;
+  const response = await fetch(url, { signal });
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(
+      `GET /bugs/${bugId}/escalation failed: HTTP ${response.status}`,
+    );
+  }
+  return (await response.json()) as EscalationDetail;
+}
+
+/** POST /bugs/:id/escalation/approve — accept the recommended approach. */
+export async function approveEscalation(
+  bugId: number,
+  signal?: AbortSignal,
+): Promise<EscalationActionResult> {
+  return apiPost<EscalationActionResult, { option_id: string }>(
+    `/bugs/${bugId}/escalation/approve`,
+    { option_id: "approve_recommended" },
+    { signal },
+  );
+}
+
+/**
+ * POST /bugs/:id/escalation/pick-alternative — pick a specific alternative.
+ * ``notes`` is optional (<=500 chars) and shows up in the Fixer's
+ * escalation context.
+ */
+export async function pickAlternative(
+  bugId: number,
+  optionId: string,
+  notes?: string,
+  signal?: AbortSignal,
+): Promise<EscalationActionResult> {
+  const body: { option_id: string; notes?: string } = { option_id: optionId };
+  if (notes !== undefined && notes.trim().length > 0) {
+    body.notes = notes;
+  }
+  return apiPost<EscalationActionResult, { option_id: string; notes?: string }>(
+    `/bugs/${bugId}/escalation/pick-alternative`,
+    body,
+    { signal },
+  );
+}
+
+/**
+ * POST /bugs/:id/escalation/take-over — mark the escalation taken-over
+ * manually. The bug stays in BLOCKED; worktree is NOT cleaned up.
+ */
+export async function takeOverEscalation(
+  bugId: number,
+  signal?: AbortSignal,
+): Promise<EscalationTakeOverResult> {
+  return apiPost<EscalationTakeOverResult, Record<string, never>>(
+    `/bugs/${bugId}/escalation/take-over`,
+    {},
+    { signal },
+  );
+}

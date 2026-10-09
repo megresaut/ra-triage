@@ -11,7 +11,14 @@ When a client submits a bug report, RA Triage takes it from there:
 
 When the fix is ready, a developer gets a running copy to check. One click approves it, and RA Triage merges and redeploys it. If a bug is too risky or too hard to fix on its own, it doesn't guess. It writes up what it found and alerts the developer.
 
-The first project it covers is **RA AVM** (`avm-backend` + `builder_frontend`). Adding another client project takes one config entry.
+### How it connects to a project
+RA Triage works with any client project that has a bug tracker and one or more git repos. Each project gets one config entry listing:
+- its Notion bug database and Slack channel,
+- its repos (for example a separate frontend and backend), with the dev and test commands for each,
+- the ports for running test copies,
+- the deny-list of code paths the agents must never change automatically.
+
+Adding a new client takes that config entry, not new code. It works with single-repo projects and with frontend + backend splits.
 
 ---
 
